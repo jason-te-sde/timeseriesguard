@@ -126,3 +126,19 @@ def test_non_finite_threshold_is_value_error():
     for bad in (float("nan"), float("inf"), float("-inf")):
         with pytest.raises(ValueError, match="finite"):
             LabelAudit().freeze_threshold(bad, caller="x")
+
+
+def test_audit_property_returns_the_audit_the_labels_were_built_with():
+    a = LabelAudit()
+    lab = AuditedLabels(np.array([0, 1]), audit=a, entity="m")
+    assert lab.audit is a
+    with a.phase(Phase.FINAL_EVALUATION):
+        lab.read("final_metrics")
+    assert lab.audit.accesses == (("m", "final_metrics", Phase.FINAL_EVALUATION),)
+
+
+def test_audit_property_is_read_only_and_exposes_no_values():
+    lab = AuditedLabels(np.array([1, 1]), audit=LabelAudit(), entity="m")
+    with pytest.raises(AttributeError):
+        lab.audit = LabelAudit()  # type: ignore[misc]
+    assert not hasattr(lab.audit, "values")

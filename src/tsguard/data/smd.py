@@ -18,6 +18,10 @@ from importlib import resources
 from pathlib import Path
 from typing import Final
 
+import numpy as np
+
+from tsguard.data.contract import check_entity
+from tsguard.data.labels import AuditedLabels, LabelAudit
 from tsguard.errors import ChecksumError, ContractError, FetchError
 
 SMD_COMMIT: Final = "7fb0e0acf89ea49908896bcc9f9e80fcfff6baf4"
@@ -56,6 +60,44 @@ class FileEntry:
     path: str
     sha256: str
     size: int
+
+
+@dataclass(frozen=True, eq=False)
+class EntityData:
+    """One machine of SMD: its train and test features and its guarded test labels.
+
+    Equality and hashing are by identity (``eq=False``): the default field-by-field
+    comparison would raise on the ambiguous truth value of an array comparison.
+
+    Attributes:
+        name: Machine name, such as ``"machine-1-1"``.
+        train: Training features, shape ``(n_train, 38)``, read-only.
+        test: Test features, shape ``(n_test, 38)``, read-only.
+        labels: Test labels, readable only through the audit (see `AuditedLabels`).
+    """
+
+    name: str
+    train: np.ndarray
+    test: np.ndarray
+    labels: AuditedLabels
+
+    @property
+    def train_end(self) -> int:
+        """Number of training rows, which is also the index where the test rows begin."""
+        return len(self.train)
+
+    @property
+    def n_test(self) -> int:
+        """Number of test rows."""
+        return len(self.test)
+
+    @property
+    def full(self) -> np.ndarray:
+        """Train rows followed by test rows, as a new array on every access.
+
+        The result is a copy that the caller owns; changing it does not change the entity.
+        """
+        return np.vstack([self.train, self.test])
 
 
 Opener = Callable[[str], bytes]
@@ -185,6 +227,43 @@ def verify(entities: Sequence[str] = ENTITIES, *, dest: Path | None = None) -> N
         if problem is not None:
             target.unlink()
             raise ChecksumError(f"{entry.path} in {root}: {problem}; deleted")
+
+
+def load_entity(name: str, *, audit: LabelAudit, dest: Path | None = None) -> EntityData:
+    """Read one machine from the verified cache and check it against the data contract.
+
+    The files are verified against the manifest first, so a corrupt or missing file fails
+    before any of it is parsed. Features are parsed as ``float64`` and made read-only; the
+    test labels are parsed as ``int8`` and handed to `AuditedLabels`, which releases them
+    only while ``audit`` is in the final-evaluation phase.
+
+    Args:
+        name: Machine name, such as ``"machine-1-1"``.
+        audit: The audit the test labels report to.
+        dest: Data directory; ``default_data_dir()`` if omitted.
+
+    Returns:
+        The entity.
+
+    Raises:
+        ValueError: If ``name`` is not an SMD machine.
+        ChecksumError: If a file of the entity is missing or does not match the manifest.
+        ContractError: If the parsed arrays violate the data contract.
+    """
+    verify([name], dest=dest)
+    root = dest if dest is not None else default_data_dir()
+    train = np.loadtxt(root / "train" / f"{name}.txt", delimiter=",", dtype=np.float64, ndmin=2)
+    test = np.loadtxt(root / "test" / f"{name}.txt", delimiter=",", dtype=np.float64, ndmin=2)
+    labels = np.loadtxt(root / "test_label" / f"{name}.txt", dtype=np.int8, ndmin=1)
+    check_entity(name, train, test, labels)
+    train.flags.writeable = False
+    test.flags.writeable = False
+    return EntityData(
+        name=name,
+        train=train,
+        test=test,
+        labels=AuditedLabels(labels, audit=audit, entity=name),
+    )
 
 
 def _check_entities(entities: Sequence[str]) -> None:

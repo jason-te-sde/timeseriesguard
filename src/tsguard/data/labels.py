@@ -140,8 +140,9 @@ class AuditedLabels:
     """The binary test labels of one entity, readable only during the final evaluation.
 
     The values are copied on construction and exposed through no other accessor than
-    `read`: there is no ``__array__`` and no public attribute, and ``repr`` shows only the
-    entity and the length.
+    `read`: there is no ``__array__`` and no public attribute that holds them, and ``repr``
+    shows only the entity and the length. The `audit` property gives access to the shared
+    phase and read log, never to values.
     """
 
     def __init__(self, values: np.ndarray, *, audit: LabelAudit, entity: str) -> None:
@@ -155,6 +156,11 @@ class AuditedLabels:
         self._values = np.array(values, dtype=np.int8, copy=True)
         self._audit = audit
         self._entity = entity
+
+    @property
+    def audit(self) -> LabelAudit:
+        """The audit these labels report to; it holds the phase and the read log, no values."""
+        return self._audit
 
     def __len__(self) -> int:
         """Number of labels."""
