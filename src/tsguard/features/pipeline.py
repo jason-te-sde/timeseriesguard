@@ -66,7 +66,7 @@ def _check_channels(x: np.ndarray, n_channels: int) -> None:
 
 
 def compute_raw_features(
-    X: np.ndarray,  # noqa: N803
+    X: np.ndarray,
     specs: Sequence[FeatureSpec],
     *,
     rows: tuple[int, int],
@@ -225,7 +225,7 @@ class FeaturePipeline:
         self._fit_end, self._mean, self._scale = end_index, mean, scale
         return raw
 
-    def fit(self, X: np.ndarray, *, end_index: int) -> FeaturePipeline:  # noqa: N803
+    def fit(self, X: np.ndarray, *, end_index: int) -> FeaturePipeline:
         """Fit the standardization on the rows ``X[:end_index]`` and nothing else.
 
         Args:
@@ -242,7 +242,7 @@ class FeaturePipeline:
         self._fit_rows(X, end_index)
         return self
 
-    def fit_transform(self, X: np.ndarray, *, end_index: int) -> np.ndarray:  # noqa: N803
+    def fit_transform(self, X: np.ndarray, *, end_index: int) -> np.ndarray:
         """Fit on ``X[:end_index]`` and return those rows standardized, computing features once.
 
         Args:
@@ -259,7 +259,7 @@ class FeaturePipeline:
         _, mean, scale = self._require_fitted()
         return _standardize(raw, mean, scale)
 
-    def transform_in_sample(self, X: np.ndarray) -> np.ndarray:  # noqa: N803
+    def transform_in_sample(self, X: np.ndarray) -> np.ndarray:
         """Return the standardized features of the rows the pipeline was fitted on.
 
         Args:
@@ -286,7 +286,7 @@ class FeaturePipeline:
 
     def transform(
         self,
-        X: np.ndarray,  # noqa: N803
+        X: np.ndarray,
         *,
         start_index: int,
         context: int = 0,

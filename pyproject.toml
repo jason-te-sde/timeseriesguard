@@ -56,6 +56,9 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "D", "T20", "N", "PT"]
 
+[tool.ruff.lint.pep8-naming]
+ignore-names = ["X", "X_*"]
+
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 
