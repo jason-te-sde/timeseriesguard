@@ -19,8 +19,8 @@ from __future__ import annotations
 
 import hashlib
 import warnings
-from collections.abc import Sequence
-from typing import Final
+from collections.abc import Mapping, Sequence
+from typing import Any, Final
 
 import numpy as np
 
@@ -45,6 +45,17 @@ features such as windowed kurtosis, on channels that are flat in training, other
 ran. Clipping acts on one value at a time, so it keeps every feature causal.
 """
 _STAT_COLUMNS: Final = 256  # columns reduced at once; bounds the temporaries of nanmean/nanstd
+
+_STATE_FIELDS: Final = (
+    "fit_end",
+    "n_channels",
+    "columns",
+    "spec_names",
+    "mean",
+    "scale",
+    "digest",
+)
+"""The keys of `FeaturePipeline.get_state`, which `FeaturePipeline.from_state` requires."""
 
 RAW_SPECS: Final[tuple[FeatureSpec, ...]] = (
     FeatureSpec("raw", "identity", 1, "channel", lambda x, c: x.copy()),
@@ -92,6 +103,38 @@ def _warmup_groups(
     column_warmup = np.array(warmup)
     return tuple(
         (int(rows), np.flatnonzero(column_warmup == rows)) for rows in np.unique(column_warmup)
+    )
+
+
+def _state_statistic(state: Mapping[str, Any], key: str, n_columns: int) -> np.ndarray:
+    """Return a private read-only copy of the statistic ``key`` of a pipeline state.
+
+    Raises:
+        ValueError: The statistic is not a vector with one finite value per column.
+    """
+    values = np.array(state[key], dtype=np.float64)
+    if values.shape != (n_columns,):
+        raise ValueError(
+            f"state field {key!r} has shape {values.shape}; expected ({n_columns},), one value "
+            f"per feature column"
+        )
+    if not np.isfinite(values).all():
+        raise ValueError(f"state field {key!r} holds NaN or infinity")
+    values.flags.writeable = False
+    return values
+
+
+def _spec_mismatch(recorded: Sequence[str], given: Sequence[str]) -> str:
+    """Describe the first place two lists of spec names differ."""
+    for position, (a, b) in enumerate(zip(recorded, given, strict=False)):
+        if a != b:
+            return (
+                f"the state was fitted with a different list of specs: position {position} is "
+                f"{a!r} in the state and {b!r} in the specs given"
+            )
+    return (
+        f"the state was fitted with {len(recorded)} specs and {len(given)} were given; the first "
+        f"{min(len(recorded), len(given))} agree"
     )
 
 
@@ -435,6 +478,83 @@ class FeaturePipeline:
         )
         self._reject_unexpected_nan(raw, first)
         return _standardize(raw, mean, scale)
+
+    def get_state(self) -> dict[str, object]:
+        """Return the fitted state as plain data, so a fit can be stored and restored.
+
+        The feature specs are functions and are not part of the state; `from_state` takes them
+        again and checks their names against the ones recorded here.
+
+        Returns:
+            A dict with ``fit_end``, ``n_channels``, ``columns`` and ``spec_names`` (lists),
+            ``mean`` and ``scale`` (float64 arrays, one value per column; copies, so changing
+            them changes nothing here) and ``digest``, the `state_digest` of this fit.
+
+        Raises:
+            RuntimeError: The pipeline is not fitted.
+        """
+        fit_end, mean, scale = self._require_fitted()
+        return {
+            "fit_end": fit_end,
+            "n_channels": self._n_channels,
+            "columns": list(self.columns),
+            "spec_names": [spec.name for spec in self._specs],
+            "mean": mean.copy(),
+            "scale": scale.copy(),
+            "digest": self.state_digest(),
+        }
+
+    @classmethod
+    def from_state(cls, specs: Sequence[FeatureSpec], state: Mapping[str, Any]) -> FeaturePipeline:
+        """Rebuild a fitted pipeline from `get_state`, without the rows it was fitted on.
+
+        The result transforms exactly as the pipeline the state came from, and refuses rows
+        before the same fit end. The statistics are copied, so the state can be discarded or
+        changed afterwards.
+
+        Args:
+            specs: The feature specs the state was fitted with, in the same order.
+            state: A state from `get_state`, possibly stored and read back.
+
+        Returns:
+            The fitted pipeline.
+
+        Raises:
+            ValueError: The state lacks a field; its spec names, columns or channel count do not
+                match ``specs``; ``fit_end`` is below 1; a statistic is not one finite value per
+                column, or a scale is below ``MIN_SCALE``; or the state's own digest does not
+                match the digest of the pipeline built from it, which means the statistics
+                changed after the state was taken.
+        """
+        missing = [key for key in _STATE_FIELDS if key not in state]
+        if missing:
+            raise ValueError(f"pipeline state has no field {', '.join(map(repr, missing))}")
+        recorded, given = list(state["spec_names"]), [spec.name for spec in specs]
+        if recorded != given:
+            raise ValueError(_spec_mismatch(recorded, given))
+        pipeline = cls(specs, n_channels=int(state["n_channels"]))
+        if list(state["columns"]) != list(pipeline.columns):
+            raise ValueError(
+                f"the state has {len(state['columns'])} feature columns that do not match the "
+                f"{len(pipeline.columns)} these specs produce"
+            )
+        fit_end = int(state["fit_end"])
+        if fit_end < 1:
+            raise ValueError(f"state field 'fit_end' must be at least 1, got {fit_end}")
+        mean = _state_statistic(state, "mean", len(pipeline.columns))
+        scale = _state_statistic(state, "scale", len(pipeline.columns))
+        if (scale < MIN_SCALE).any():
+            raise ValueError(
+                f"state field 'scale' holds {int((scale < MIN_SCALE).sum())} values below "
+                f"MIN_SCALE {MIN_SCALE}, which no fit produces"
+            )
+        pipeline._fit_end, pipeline._mean, pipeline._scale = fit_end, mean, scale
+        if pipeline.state_digest() != state["digest"]:
+            raise ValueError(
+                "the state's digest does not match the pipeline built from it: its fit_end, "
+                "columns or statistics changed after the state was taken"
+            )
+        return pipeline
 
     def state_digest(self) -> str:
         """Return a sha256 over the fit end, the column names and the fitted statistics.

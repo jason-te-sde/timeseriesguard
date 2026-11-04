@@ -544,3 +544,125 @@ def test_the_clip_applies_in_sample_too(full, entity):
         assert out[1000, CONSTANT_CHANNEL] == STANDARD_CLIP
         assert np.abs(out).max() <= STANDARD_CLIP
     assert fit_transformed.tobytes() == in_sample.tobytes()
+
+
+# ---------------------------------------------------------------- fitted state
+
+
+STATE_KEYS = {"fit_end", "n_channels", "columns", "spec_names", "mean", "scale", "digest"}
+
+
+def test_get_state_holds_what_a_fit_computed(fitted, entity):
+    state = fitted.get_state()
+    assert set(state) == STATE_KEYS
+    assert state["fit_end"] == entity.train_end
+    assert state["n_channels"] == N_CHANNELS
+    assert state["columns"] == list(fitted.columns)
+    assert state["spec_names"] == [spec.name for spec in FEATURE_SPECS]
+    assert state["digest"] == fitted.state_digest()
+    assert np.asarray(state["mean"]).shape == np.asarray(state["scale"]).shape == (N_COLUMNS,)
+
+
+def test_get_state_hands_out_copies(full, entity):
+    pipeline = FeaturePipeline().fit(full, end_index=entity.train_end)
+    digest = pipeline.state_digest()
+    state = pipeline.get_state()
+    mean = np.asarray(state["mean"])
+    mean.flags.writeable = True
+    mean[:] = 123.0
+    assert pipeline.state_digest() == digest
+
+
+def test_an_unfitted_pipeline_has_no_state():
+    with pytest.raises(RuntimeError, match="not fitted"):
+        FeaturePipeline().get_state()
+
+
+@pytest.mark.parametrize("specs", [FEATURE_SPECS, RAW_SPECS], ids=["features", "raw"])
+def test_state_round_trips_to_a_pipeline_that_transforms_bit_for_bit(specs, full, entity):
+    original = FeaturePipeline(specs).fit(full, end_index=entity.train_end)
+    restored = FeaturePipeline.from_state(specs, original.get_state())
+    assert restored.fit_end == original.fit_end == entity.train_end
+    assert restored.columns == original.columns
+    assert restored.state_digest() == original.state_digest()
+    start = entity.train_end + 100
+    a = original.transform(full, start_index=start, context=7)
+    b = restored.transform(full, start_index=start, context=7)
+    assert a.tobytes() == b.tobytes()
+
+
+def test_a_restored_pipeline_does_not_share_arrays_with_the_state(full, entity):
+    state = FeaturePipeline().fit(full, end_index=entity.train_end).get_state()
+    restored = FeaturePipeline.from_state(FEATURE_SPECS, state)
+    digest = restored.state_digest()
+    mean = np.asarray(state["mean"])
+    mean.flags.writeable = True
+    mean[:] = 7.0
+    assert restored.state_digest() == digest
+
+
+def test_a_restored_pipeline_still_refuses_rows_before_its_fit_end(full, entity):
+    restored = FeaturePipeline.from_state(
+        FEATURE_SPECS, FeaturePipeline().fit(full, end_index=entity.train_end).get_state()
+    )
+    with pytest.raises(LeakageError) as caught:
+        restored.transform(full, start_index=entity.train_end - 1)
+    assert caught.value.guard == GUARD_FIT_END
+
+
+def test_from_state_refuses_other_specs(fitted):
+    fewer = FEATURE_SPECS[:-1]
+    with pytest.raises(ValueError, match="specs"):
+        FeaturePipeline.from_state(fewer, fitted.get_state())
+    swapped = (FEATURE_SPECS[1], FEATURE_SPECS[0], *FEATURE_SPECS[2:])
+    with pytest.raises(ValueError, match=r"lag_1|lag_2"):
+        FeaturePipeline.from_state(swapped, fitted.get_state())
+
+
+def test_from_state_refuses_a_state_without_a_field(fitted):
+    state = fitted.get_state()
+    del state["scale"]
+    with pytest.raises(ValueError, match="scale"):
+        FeaturePipeline.from_state(FEATURE_SPECS, state)
+
+
+def test_from_state_refuses_statistics_that_do_not_match_the_digest(fitted):
+    state = fitted.get_state()
+    mean = np.array(state["mean"])
+    mean[3] += 1e-9
+    state["mean"] = mean
+    with pytest.raises(ValueError, match="digest"):
+        FeaturePipeline.from_state(FEATURE_SPECS, state)
+
+
+@pytest.mark.parametrize("key", ["mean", "scale"])
+def test_from_state_refuses_statistics_of_the_wrong_length(key, fitted):
+    state = fitted.get_state()
+    state[key] = np.asarray(state[key])[:-1]
+    with pytest.raises(ValueError, match=key):
+        FeaturePipeline.from_state(FEATURE_SPECS, state)
+
+
+def test_from_state_refuses_a_scale_below_the_floor(fitted):
+    state = fitted.get_state()
+    scale = np.array(state["scale"])
+    scale[0] = MIN_SCALE / 10
+    state["scale"] = scale
+    with pytest.raises(ValueError, match="scale"):
+        FeaturePipeline.from_state(FEATURE_SPECS, state)
+
+
+def test_from_state_refuses_a_non_finite_mean(fitted):
+    state = fitted.get_state()
+    mean = np.array(state["mean"])
+    mean[0] = np.nan
+    state["mean"] = mean
+    with pytest.raises(ValueError, match="mean"):
+        FeaturePipeline.from_state(FEATURE_SPECS, state)
+
+
+def test_from_state_refuses_a_non_positive_fit_end(fitted):
+    state = fitted.get_state()
+    state["fit_end"] = 0
+    with pytest.raises(ValueError, match="fit_end"):
+        FeaturePipeline.from_state(FEATURE_SPECS, state)
