@@ -24,6 +24,7 @@ from tsguard.errors import TsguardError
 from tsguard.experiment.reproduce import PROFILES, reproduce
 from tsguard.experiment.tracking import MlflowTracker, export_runs
 from tsguard.experiment.tuning import FINAL_EXPERIMENT, TUNING_EXPERIMENT
+from tsguard.models import MODEL_NAMES
 from tsguard.repro.claims import check_claims, write_claims
 
 PROG: Final = "tsguard"
@@ -152,7 +153,8 @@ def _stderr_progress(started: float) -> Callable[[str], None]:
 def _reproduce(args: argparse.Namespace) -> int:
     profile = PROFILES[args.profile]
     if args.entities:
-        profile = replace(profile, entities=_entities(args.entities))
+        # A run on other entities is not the profile's run: its metrics must not pass for it.
+        profile = replace(profile, name=f"{profile.name}-custom", entities=_entities(args.entities))
     out: Path = args.out
     uri = _tracking_uri(args.tracking_uri, out)
     started = time.monotonic()
@@ -169,6 +171,14 @@ def _reproduce(args: argparse.Namespace) -> int:
     )
     csv_path = out / "mlflow_runs.csv"
     rows = export_runs(uri, csv_path, experiments=[TUNING_EXPERIMENT, FINAL_EXPERIMENT])
+    expected = len(MODEL_NAMES) * (profile.n_trials + len(profile.entities))
+    if rows != expected:
+        raise CliError(
+            f"{csv_path} has {rows} runs, expected {expected} ({len(MODEL_NAMES)} models x "
+            f"{profile.n_trials} trials + {len(MODEL_NAMES)} models x {len(profile.entities)} "
+            f"entities): the tracking store {uri} holds runs from another run, or lost some, "
+            f"so the CSV does not describe {out / 'metrics.json'}; use a fresh --tracking-uri"
+        )
     print(f"wrote {out / 'metrics.json'} and {csv_path} ({rows} runs)")
     return 0
 

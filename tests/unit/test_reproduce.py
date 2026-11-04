@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import re
 import subprocess
 import sys
 import weakref
@@ -62,6 +63,13 @@ class TinyRun:
     # for each load, whether every runner built before it was already freed
     runners_freed_at_load: list[bool] = field(default_factory=list)
     ablation_calls: list[dict[str, object]] = field(default_factory=list)
+    # test-label reads over every audit, at the moment each progress line was logged
+    reads_at_line: list[int] = field(default_factory=list)
+    # (objectives given, model returned, reads over every audit) for each call of best_model
+    best_model_calls: list[tuple[dict[str, float], str, int]] = field(default_factory=list)
+    # what the output directory held when the ablation started
+    files_at_ablation: list[str] = field(default_factory=list)
+    partial_at_ablation: Metrics | None = None
 
 
 @pytest.fixture(scope="module")
@@ -69,10 +77,12 @@ def tiny_run(tmp_path_factory: pytest.TempPathFactory) -> TinyRun:
     """Run the whole pipeline once on two synthetic entities; the slow tests share it."""
     out_dir = tmp_path_factory.mktemp("tiny")
     tracker = MemoryTracker()
-    lines: list[str] = []
     refs: list[weakref.ReferenceType[EntityRunner]] = []
-    freed: list[bool] = []
-    ablation_calls: list[dict[str, object]] = []
+    audits: list[LabelAudit] = []
+    run = TinyRun(Metrics.model_construct(), tracker, out_dir, [])
+
+    def total_reads() -> int:
+        return sum(audit.reads for audit in audits)
 
     class SpyRunner(EntityRunner):
         def __init__(self, *args, **kwargs):
@@ -81,20 +91,34 @@ def tiny_run(tmp_path_factory: pytest.TempPathFactory) -> TinyRun:
 
     def loader(name: str, audit: LabelAudit) -> EntityData:
         # No gc.collect() here: reproduce itself must have released the earlier runners.
-        freed.append(all(ref() is None for ref in refs))
+        run.runners_freed_at_load.append(all(ref() is None for ref in refs))
+        audits.append(audit)
         return load_synthetic(name, audit)
 
+    def progress(line: str) -> None:
+        run.lines.append(line)
+        run.reads_at_line.append(total_reads())
+
+    def spy_best_model(objectives):
+        chosen = best_model(objectives)
+        run.best_model_calls.append((dict(objectives), chosen, total_reads()))
+        return chosen
+
     def spy_ablation(entities, **kwargs):
-        ablation_calls.append({"entities": tuple(entities), **kwargs})
+        run.ablation_calls.append({"entities": tuple(entities), **kwargs})
+        run.files_at_ablation = sorted(path.name for path in out_dir.iterdir())
+        partial_path = out_dir / "metrics.partial.json"
+        run.partial_at_ablation = read_metrics(partial_path) if partial_path.exists() else None
         return run_ablation(entities, **kwargs)
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(reproduce_module, "EntityRunner", SpyRunner)
         patch.setattr(reproduce_module, "run_ablation", spy_ablation)
-        metrics = reproduce(
-            TINY, loader=loader, tracker=tracker, out_dir=out_dir, progress=lines.append
+        patch.setattr(reproduce_module, "best_model", spy_best_model)
+        run.metrics = reproduce(
+            TINY, loader=loader, tracker=tracker, out_dir=out_dir, progress=progress
         )
-    return TinyRun(metrics, tracker, out_dir, lines, freed, ablation_calls)
+    return run
 
 
 @pytest.mark.slow
@@ -140,8 +164,14 @@ def test_tiny_reproduce_describes_the_run(tiny_run):
 def test_macro_scores_are_the_means_over_entities(tiny_run):
     for summary in tiny_run.metrics.models.values():
         for protocol in PROTOCOLS:
-            per_entity = [e.protocols[protocol].auc_pr for e in summary.per_entity]
-            assert summary.macro[protocol].auc_pr == pytest.approx(np.mean(per_entity), abs=1e-12)
+            for score in ("auc_pr", "f1", "f1_oracle"):
+                per_entity = [getattr(e.protocols[protocol], score) for e in summary.per_entity]
+                macro = getattr(summary.macro[protocol], score)
+                assert macro == pytest.approx(np.mean(per_entity), abs=1e-12), (protocol, score)
+        assert set(summary.sensitivity_macro) == set(summary.per_entity[0].sensitivity)
+        for key, macro in summary.sensitivity_macro.items():
+            per_entity = [e.sensitivity[key] for e in summary.per_entity]
+            assert macro == pytest.approx(np.mean(per_entity), abs=1e-12), key
         objectives = [e.validation_objective for e in summary.per_entity]
         assert summary.validation_objective == pytest.approx(np.mean(objectives), abs=1e-12)
 
@@ -193,6 +223,73 @@ def test_ablation_gets_the_tuned_feature_params_and_skips_the_causal_check(tiny_
     config = call["config"]
     assert config == dataclasses.replace(TINY.run, causal_check=False)
     assert TINY.run.causal_check  # the selection phase keeps the check on
+
+
+HEADLINE_LINE = re.compile(
+    r"^headline chosen before any test label: (\w+) \(validation objective (\d\.\d{4})\)$"
+)
+
+
+def line_index(lines: list[str], prefix: str) -> int:
+    return next(i for i, line in enumerate(lines) if line.startswith(prefix))
+
+
+@pytest.mark.slow
+def test_the_headline_is_chosen_once_before_any_test_label_is_read(tiny_run):
+    m = tiny_run.metrics
+    ((objectives, chosen, reads),) = tiny_run.best_model_calls  # chosen once, not recomputed
+    assert reads == 0
+    assert chosen == m.headline.model
+    assert objectives == {name: s.validation_objective for name, s in m.models.items()}
+
+
+@pytest.mark.slow
+def test_the_headline_line_comes_after_the_blind_check_and_before_evaluation(tiny_run):
+    lines, m = tiny_run.lines, tiny_run.metrics
+    at = line_index(lines, "headline chosen")
+    match = HEADLINE_LINE.match(lines[at])
+    assert match, lines[at]
+    assert match.group(1) == m.headline.model
+    assert match.group(2) == f"{m.models[m.headline.model].validation_objective:.4f}"
+    assert tiny_run.reads_at_line[at] == 0
+    assert line_index(lines, "selection done: 0 test-label reads") < at
+    first_evaluation = line_index(lines, "evaluate ")
+    assert at < first_evaluation
+    assert tiny_run.reads_at_line[first_evaluation] > 0  # the reads did start there
+    assert at < next(i for i, line in enumerate(lines) if " seed=0 " in line)  # before the ablation
+
+
+@pytest.mark.slow
+def test_a_checkpoint_without_the_ablation_exists_while_the_ablation_runs(tiny_run):
+    m, partial = tiny_run.metrics, tiny_run.partial_at_ablation
+    assert tiny_run.files_at_ablation == ["metrics.partial.json"]
+    assert partial is not None
+    assert partial.profile == "tiny-partial"
+    assert partial.ablation == {}
+    rest = {"profile", "ablation", "environment"}
+    assert partial.model_dump(exclude=rest) == m.model_dump(exclude=rest)
+
+
+@pytest.mark.slow
+def test_a_successful_run_leaves_only_metrics_json(tiny_run):
+    assert sorted(path.name for path in tiny_run.out_dir.iterdir()) == ["metrics.json"]
+
+
+@pytest.mark.slow
+def test_a_failing_ablation_leaves_the_checkpoint_and_no_metrics_json(tmp_path, monkeypatch):
+    def failing_ablation(entities, **kwargs):
+        raise RuntimeError("the ablation failed")
+
+    monkeypatch.setattr(reproduce_module, "run_ablation", failing_ablation)
+    with pytest.raises(RuntimeError, match="the ablation failed"):
+        reproduce(TINY, loader=load_synthetic, tracker=MemoryTracker(), out_dir=tmp_path)
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["metrics.partial.json"]
+    partial = read_metrics(tmp_path / "metrics.partial.json")
+    assert partial.profile == "tiny-partial"
+    assert partial.ablation == {}
+    assert set(partial.models) == set(MODEL_NAMES)
+    assert partial.headline.label_reads_at_selection == 0
+    assert partial.headline.model in MODEL_NAMES
 
 
 @pytest.mark.slow

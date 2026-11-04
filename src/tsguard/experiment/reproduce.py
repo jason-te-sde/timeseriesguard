@@ -10,11 +10,16 @@ a fixed order, and the order is what the leakage claims rest on:
    cached features on a real entity, so it is dropped before the next entity is loaded. What
    stays is small: the selections (without fitted models), the entity's guarded labels and its
    audit.
-3. **The blind check.** Every audit must have logged zero reads, and every frozen threshold
-   must predate every read, or the run stops with a `RuntimeError` before a single test label
-   is used.
+3. **The blind check and the headline.** Every audit must have logged zero reads, and every
+   frozen threshold must predate every read, or the run stops with a `RuntimeError` before a
+   single test label is used. Right after it the headline model is chosen from the selections'
+   validation objectives and announced, so the choice demonstrably precedes every test label.
 4. **Evaluation.** Each selection is scored on the test labels, once.
-5. **Ablation.** The FFT features are removed and re-added on the frozen selections of the
+5. **Checkpoint.** ``metrics.partial.json`` (a valid `Metrics` with an empty ablation, under the
+   profile name ``<name>-partial``) is written before the ablation, so a failure in the long
+   ablation cannot discard the tuning, selection and evaluation above. It is deleted once
+   ``metrics.json`` is written.
+6. **Ablation.** The FFT features are removed and re-added on the frozen selections of the
    feature models, over several seeds (see `tsguard.experiment.ablation`). It runs with
    ``causal_check=False``: both arms use specs the selection phase already verified causal
    (the 53-spec arm is a subset of the same registry and pipeline), so repeating the
@@ -72,6 +77,8 @@ from tsguard.repro.report import (
 from tsguard.repro.seeding import configure_runtime
 
 HEADLINE_PROTOCOL: Final = "event_level"
+METRICS_FILE: Final = "metrics.json"
+PARTIAL_FILE: Final = "metrics.partial.json"
 UNKNOWN_REVISION: Final = "unknown"
 _PACKAGES: Final = ("numpy", "pandas", "scikit-learn", "torch", "optuna", "mlflow")
 _NOT_INSTALLED: Final = "not installed"
@@ -225,13 +232,18 @@ def reproduce(
 ) -> Metrics:
     """Run every phase of a profile and write ``metrics.json``.
 
+    ``metrics.partial.json`` appears in ``out_dir`` before the ablation starts and is removed
+    when ``metrics.json`` is written, so after a failure in the ablation the partial file is
+    what remains.
+
     Args:
         profile: What to run.
         loader: Loads an entity whose labels report to the audit it is given; called once per
             entity in each phase that needs the entity, so a phase never holds more than it
             uses.
         tracker: Where the tuning trials and the final runs are recorded.
-        out_dir: Directory for ``metrics.json``; created if missing.
+        out_dir: Directory for ``metrics.json`` and ``metrics.partial.json``; created if
+            missing.
         progress: Called with one line per phase, entity and model step.
 
     Returns:
@@ -256,8 +268,37 @@ def reproduce(
     selections = [s for record in records for s in record.selections.values()]
     reads = label_reads_at_selection([*tuning_audits, *(r.audit for r in records)], selections)
     progress(f"selection done: {reads} test-label reads")
+    objective = _macro_objectives(records)
+    chosen = best_model(objective)
+    progress(
+        f"headline chosen before any test label: {chosen} "
+        f"(validation objective {objective[chosen]:.4f})"
+    )
     evaluations, n_segments = _evaluate(records, profile, progress)
-    ablation = run_ablation(
+    models = {
+        model: _summarize_model(model, tuned[model], records, evaluations, objective[model])
+        for model in MODEL_NAMES
+    }
+    headline = _headline(profile, chosen, models[chosen], reads)
+
+    def assemble(name: str, ablation: dict[str, AblationModel]) -> Metrics:
+        return _metrics(
+            profile,
+            name=name,
+            records=records,
+            n_segments=n_segments,
+            tuned=tuned,
+            models=models,
+            headline=headline,
+            ablation=ablation,
+            revision=revision,
+        )
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    partial_path = out_dir / PARTIAL_FILE
+    write_metrics(partial_path, assemble(f"{profile.name}-partial", {}))
+    progress(f"checkpoint before the ablation: wrote {partial_path}")
+    summaries = run_ablation(
         profile.entities,
         loader=loader,
         params={model: tuned[model].best_params for model in FEATURE_MODELS},
@@ -265,13 +306,31 @@ def reproduce(
         config=dataclasses.replace(profile.run, causal_check=False),
         progress=progress,
     )
-    models = {
-        model: _summarize_model(model, tuned[model], records, evaluations) for model in MODEL_NAMES
-    }
-    headline = _headline(profile, models, reads)
-    metrics = Metrics(
+    metrics = assemble(
+        profile.name, {model: _ablation_model(summary) for model, summary in summaries.items()}
+    )
+    write_metrics(out_dir / METRICS_FILE, metrics)
+    partial_path.unlink()
+    progress(f"wrote {out_dir / METRICS_FILE}")
+    return metrics
+
+
+def _metrics(
+    profile: Profile,
+    *,
+    name: str,
+    records: Sequence[_EntityRecord],
+    n_segments: int,
+    tuned: Mapping[str, TuningResult],
+    models: dict[str, ModelSummaryModel],
+    headline: HeadlineModel,
+    ablation: dict[str, AblationModel],
+    revision: str,
+) -> Metrics:
+    """Assemble the validated metrics; the checkpoint and the final file differ in two fields."""
+    return Metrics(
         schema_version=1,
-        profile=profile.name,
+        profile=name,
         seed=profile.run.seed,
         dataset=DatasetModel(
             source_commit=SMD_COMMIT,
@@ -285,7 +344,7 @@ def reproduce(
         feature_specs=len(FEATURE_SPECS),
         models=models,
         headline=headline,
-        ablation={model: _ablation_model(summary) for model, summary in ablation.items()},
+        ablation=ablation,
         tuning=TuningModel(
             entities=list(profile.tuning_entities),
             n_trials=profile.n_trials,
@@ -296,10 +355,6 @@ def reproduce(
         ),
         environment=_environment(revision),
     )
-    out_dir.mkdir(parents=True, exist_ok=True)
-    write_metrics(out_dir / "metrics.json", metrics)
-    progress(f"wrote {out_dir / 'metrics.json'}")
-    return metrics
 
 
 def _tune_all(
@@ -399,8 +454,13 @@ def _summarize_model(
     tuning: TuningResult,
     records: Sequence[_EntityRecord],
     evaluations: Mapping[tuple[str, str], Evaluation],
+    validation_objective: float,
 ) -> ModelSummaryModel:
-    """Build one model's per-entity results and their macro means over the entities."""
+    """Build one model's per-entity results and their macro means over the entities.
+
+    ``validation_objective`` is the macro value `_macro_objectives` computed before any label
+    was read; taking it as given keeps the table and the headline choice on one float.
+    """
     per_entity = []
     for record in records:
         selection = record.selections[model]
@@ -417,7 +477,7 @@ def _summarize_model(
         )
     return ModelSummaryModel(
         params=dict(tuning.best_params),
-        validation_objective=_mean(r.validation_objective for r in per_entity),
+        validation_objective=validation_objective,
         macro={
             name: ProtocolScoreModel(
                 auc_pr=_mean(r.protocols[name].auc_pr for r in per_entity),
@@ -447,18 +507,27 @@ def best_model(validation_objective: Mapping[str, float]) -> str:
     return max(MODEL_NAMES, key=lambda model: validation_objective[model])
 
 
+def _macro_objectives(records: Sequence[_EntityRecord]) -> dict[str, float]:
+    """Return each model's validation objective, averaged over the entities.
+
+    Only selections feed it, so it is available before any test label is read.
+    """
+    return {
+        model: _mean(record.selections[model].objective for record in records)
+        for model in MODEL_NAMES
+    }
+
+
 def _headline(
-    profile: Profile, models: Mapping[str, ModelSummaryModel], reads: int
+    profile: Profile, chosen: str, summary: ModelSummaryModel, reads: int
 ) -> HeadlineModel:
-    """Report the event-level score of the model with the best macro validation objective."""
-    best = best_model({model: summary.validation_objective for model, summary in models.items()})
-    chosen = models[best]
-    per_entity = [e.protocols[HEADLINE_PROTOCOL].auc_pr for e in chosen.per_entity]
+    """Report the event-level score of the model that was chosen before evaluation."""
+    per_entity = [e.protocols[HEADLINE_PROTOCOL].auc_pr for e in summary.per_entity]
     low, high = bootstrap_ci(per_entity, seed=profile.run.seed)
     return HeadlineModel(
-        model=best,
+        model=chosen,
         protocol=HEADLINE_PROTOCOL,
-        auc_pr=chosen.macro[HEADLINE_PROTOCOL].auc_pr,
+        auc_pr=summary.macro[HEADLINE_PROTOCOL].auc_pr,
         ci95=(low, high),
         selected_by="validation_objective",
         label_reads_at_selection=reads,

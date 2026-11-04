@@ -19,6 +19,7 @@ from tsguard.repro.report import write_metrics
 # MLflow's SQLAlchemy store triggers a deprecation warning inside SQLAlchemy on first use.
 pytestmark = pytest.mark.filterwarnings("ignore:The ``noload`` loader strategy")
 
+SMOKE_RUNS = 16  # 4 models x 2 trials + 4 models x 2 entities
 STAMP = re.compile(r"^\[\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ \+\d+\.\ds\] (.*)$")
 
 
@@ -152,7 +153,7 @@ def test_reproduce_wires_profile_and_export(monkeypatch, tmp_path):
 
     def fake_export(uri, path, *, experiments):
         seen.update(uri=uri, csv=path, experiments=list(experiments))
-        return 16
+        return SMOKE_RUNS
 
     monkeypatch.setattr(cli, "reproduce", fake_reproduce)
     monkeypatch.setattr(cli, "export_runs", fake_export)
@@ -168,12 +169,46 @@ def test_reproduce_wires_profile_and_export(monkeypatch, tmp_path):
 def test_reproduce_entities_override_only_the_evaluated_entities(monkeypatch, tmp_path):
     seen: dict[str, Any] = {}
     monkeypatch.setattr(cli, "reproduce", lambda profile, **kw: seen.update(profile=profile))
-    monkeypatch.setattr(cli, "export_runs", lambda uri, path, *, experiments: 0)
+    monkeypatch.setattr(cli, "export_runs", lambda uri, path, *, experiments: 4 * 2 + 4 * 1)
     argv = ["reproduce", "--profile", "smoke", "--out", str(tmp_path), "--entities", "machine-1-2"]
     assert main(argv) == 0
     assert seen["profile"].entities == ("machine-1-2",)
     assert seen["profile"].tuning_entities == SMOKE.tuning_entities
     assert seen["profile"].n_trials == SMOKE.n_trials
+
+
+def test_an_entities_override_renames_the_profile_so_its_metrics_cannot_pass_for_the_real_run(
+    monkeypatch, tmp_path
+):
+    names: list[str] = []
+    monkeypatch.setattr(cli, "reproduce", lambda profile, **kw: names.append(profile.name))
+    monkeypatch.setattr(cli, "export_runs", lambda uri, path, *, experiments: SMOKE_RUNS)
+    assert main(["reproduce", "--profile", "smoke", "--out", str(tmp_path / "a")]) == 0
+    argv = ["reproduce", "--profile", "smoke", "--out", str(tmp_path / "b"), "--entities"]
+    assert main([*argv, "machine-1-1", "machine-2-1"]) == 0  # the same entities, still a custom run
+    assert names == ["smoke", "smoke-custom"]
+
+
+def test_a_wrong_exported_run_count_is_an_error(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(cli, "reproduce", lambda profile, **kw: None)
+    monkeypatch.setattr(cli, "export_runs", lambda uri, path, *, experiments: SMOKE_RUNS + 4)
+    assert main(["reproduce", "--profile", "smoke", "--out", str(tmp_path)]) == 1
+    captured = capsys.readouterr()
+    # MLflow's own INFO lines may precede ours the first time a client is built in a process
+    assert captured.err.strip().splitlines()[-1].startswith("tsguard: error: ")
+    assert f"{SMOKE_RUNS + 4} runs" in captured.err
+    assert f"expected {SMOKE_RUNS}" in captured.err
+    assert "mlflow_runs.csv" in captured.err
+    assert "--tracking-uri" in captured.err
+    assert captured.out == ""  # no success line for a run whose export is wrong
+
+
+def test_the_expected_run_count_follows_the_evaluated_entities(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(cli, "reproduce", lambda profile, **kw: None)
+    monkeypatch.setattr(cli, "export_runs", lambda uri, path, *, experiments: SMOKE_RUNS)
+    argv = ["reproduce", "--profile", "smoke", "--out", str(tmp_path), "--entities", "machine-1-2"]
+    assert main(argv) == 1  # one entity gives 4 x 2 + 4 x 1 = 12 runs, not 16
+    assert "expected 12" in capsys.readouterr().err
 
 
 def test_reproduce_rejects_an_unknown_entity_before_any_work(monkeypatch, tmp_path, capsys):
@@ -212,7 +247,7 @@ def test_reproduce_creates_the_directory_of_a_new_tracking_store(monkeypatch, tm
     seen: dict[str, Any] = {}
     monkeypatch.setattr(cli, "reproduce", lambda profile, **kw: None)
     monkeypatch.setattr(
-        cli, "export_runs", lambda uri, path, *, experiments: seen.update(uri=uri) or 0
+        cli, "export_runs", lambda uri, path, *, experiments: seen.update(uri=uri) or SMOKE_RUNS
     )
     uri = f"sqlite:///{tmp_path / 'deep' / 'er' / 'runs.db'}"
     argv = [
@@ -237,7 +272,7 @@ def test_reproduce_progress_lines_carry_a_utc_stamp_and_elapsed_seconds(
         progress("select machine-1-1 zscore: validation objective 0.4")
 
     monkeypatch.setattr(cli, "reproduce", fake_reproduce)
-    monkeypatch.setattr(cli, "export_runs", lambda uri, path, *, experiments: 0)
+    monkeypatch.setattr(cli, "export_runs", lambda uri, path, *, experiments: SMOKE_RUNS)
     assert main(["reproduce", "--profile", "smoke", "--out", str(tmp_path)]) == 0
     captured = capsys.readouterr()
     stamped = [line for line in captured.err.splitlines() if STAMP.match(line)]
@@ -261,7 +296,7 @@ def test_reproduce_loads_entities_from_the_data_directory(monkeypatch, tmp_path)
         return "entity"
 
     monkeypatch.setattr(cli, "reproduce", fake_reproduce)
-    monkeypatch.setattr(cli, "export_runs", lambda uri, path, *, experiments: 0)
+    monkeypatch.setattr(cli, "export_runs", lambda uri, path, *, experiments: SMOKE_RUNS)
     monkeypatch.setattr(cli, "load_entity", fake_load_entity)
     assert main(["reproduce", "--profile", "smoke", "--out", str(tmp_path)]) == 0
     audit = LabelAudit()
