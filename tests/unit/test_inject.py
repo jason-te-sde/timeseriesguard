@@ -13,6 +13,7 @@ from tsguard.eval.inject import (
 
 CHANNELS = 38
 START, END = 300, 4300
+DRAW_ORDER_SEED = 10
 
 
 def _series(rng: np.random.Generator, rows: int = 5000) -> np.ndarray:
@@ -194,10 +195,18 @@ def test_draw_order_is_the_documented_one():
     start, end = 500, 5500
 
     out, _, segments = inject(
-        X, start=start, end=end, sigma=sigma, rng=np.random.default_rng(11), config=config
+        X,
+        start=start,
+        end=end,
+        sigma=sigma,
+        rng=np.random.default_rng(DRAW_ORDER_SEED),
+        config=config,
     )
+    # Seed 10 plants a variance burst in the third slot and a level shift in the fourth, so a
+    # noise draw that moves before the sign draw or after the loop changes the output.
+    assert {"variance_burst", "level_shift"} <= {seg.kind for seg in segments}
 
-    draws = np.random.default_rng(11)
+    draws = np.random.default_rng(DRAW_ORDER_SEED)
     expected = X.copy()
     n = max(2, (end - start) // config.rows_per_segment)
     slot = (end - start) // n
@@ -232,7 +241,7 @@ def test_draw_order_is_the_documented_one():
     assert np.array_equal(out, expected)
 
 
-@pytest.mark.parametrize(("start", "end"), [(-1, 4000), (1000, 99_999), (500, 500)])
+@pytest.mark.parametrize(("start", "end"), [(-1, 4000), (1000, 99_999), (3000, 2000)])
 def test_block_outside_the_series_is_value_error(rng, start, end):
     X = _series(rng)
     with pytest.raises(ValueError, match="does not lie inside"):
@@ -243,3 +252,36 @@ def test_sigma_of_the_wrong_length_is_value_error(rng):
     X = _series(rng)
     with pytest.raises(ValueError, match="sigma"):
         inject(X, start=START, end=END, sigma=np.ones(CHANNELS - 1), rng=rng)
+
+
+def test_empty_block_is_value_error(rng):
+    X = _series(rng)
+    with pytest.raises(ValueError, match="empty"):
+        inject(X, start=500, end=500, sigma=_sigma(rng), rng=rng)
+
+
+def test_x_with_fewer_columns_than_max_channels_is_value_error(rng):
+    X = rng.random((5000, 5))
+    with pytest.raises(ValueError, match=r"5 channels.*max_channels = 8"):
+        inject(X, start=START, end=END, sigma=np.ones(5), rng=rng)
+
+
+def test_numpy_integer_bounds_give_plain_int_segments(rng):
+    X = _series(rng)
+    sigma = _sigma(rng)
+    seed = int(rng.integers(2**31))
+    plain = inject(X, start=START, end=END, sigma=sigma, rng=np.random.default_rng(seed))
+    # The signature says int; numpy integers (a row index read from an array) must also work.
+    numpy_ints = inject(
+        X,
+        start=np.int64(START),  # type: ignore[arg-type]
+        end=np.int64(END),  # type: ignore[arg-type]
+        sigma=sigma,
+        rng=np.random.default_rng(seed),
+    )
+    assert numpy_ints[2] == plain[2]
+    assert np.array_equal(numpy_ints[0], plain[0])
+    assert np.array_equal(numpy_ints[1], plain[1])
+    for seg in numpy_ints[2]:
+        assert type(seg.start) is int
+        assert type(seg.length) is int

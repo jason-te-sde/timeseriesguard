@@ -110,16 +110,18 @@ def inject(
        ``rng.uniform(log(min_len), log(max_len))``; then capped at ``slot - gap``.
     3. ``offset = rng.integers(0, slot - gap - length + 1)``; the segment starts at
        ``slot_start + gap // 2 + offset``.
-    4. ``m = rng.integers(1, max_channels + 1)``, then ``rng.choice(channels, m, replace=False)``.
+    4. ``m = rng.integers(1, max_channels + 1)``, then ``rng.choice(n_channels, m,
+       replace=False)``, which draws ``m`` distinct channels from ``range(n_channels)``.
     5. ``magnitude = rng.uniform(min_sigma, max_sigma)``, then the sign from ``rng.random()``.
     6. Spike and level shift add ``sign * magnitude * sigma`` to the chosen channels, a variance
        burst adds ``rng.standard_normal((length, m)) * magnitude * sigma``, and a flatline
        holds the value of its first row.
 
     Args:
-        X: Array of shape ``(rows, channels)``. It is never modified.
+        X: Array of shape ``(rows, channels)`` with at least ``max_channels`` channels. It is
+            never modified.
         start: First row of the block.
-        end: Exclusive end of the block.
+        end: Exclusive end of the block, greater than ``start``.
         sigma: Per-channel scale, shape ``(channels,)``; see `reference_sigma`.
         rng: The only source of randomness.
         config: Sizes and counts of the segments.
@@ -129,14 +131,22 @@ def inject(
         ``[start, end)`` (1 on a planted row), and the planted segments in row order.
 
     Raises:
-        ValueError: The block does not lie inside ``X``, ``sigma`` does not have one entry per
-            channel, or a slot is too small to hold ``gap + min_len`` rows.
+        ValueError: The block is empty or does not lie inside ``X``, ``sigma`` does not have
+            one entry per channel, ``X`` has fewer channels than ``max_channels``, or a slot is
+            too small to hold ``gap + min_len`` rows.
     """
+    start, end = int(start), int(end)
     rows, n_channels = X.shape
+    if start == end:
+        raise ValueError(f"block [{start}, {end}) is empty")
     if not 0 <= start < end <= rows:
         raise ValueError(f"block [{start}, {end}) does not lie inside the {rows} rows of X")
     if sigma.shape != (n_channels,):
         raise ValueError(f"sigma must have shape ({n_channels},), got {sigma.shape}")
+    if n_channels < config.max_channels:
+        raise ValueError(
+            f"X has {n_channels} channels, fewer than max_channels = {config.max_channels}"
+        )
     block = end - start
     n = max(2, block // config.rows_per_segment)
     slot = block // n
