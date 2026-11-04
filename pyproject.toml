@@ -36,6 +36,9 @@ dev = [
     "mypy",
     "pandas-stubs",
     "httpx",
+    # Starlette's test client (and so FastAPI's) prefers httpx2 and warns when it falls back to
+    # httpx. httpx stays for scripts/latency.py, which talks to a running service.
+    "httpx2>=2.0.0",
 ]
 
 [tool.hatch.build.targets.wheel]
