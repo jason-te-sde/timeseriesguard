@@ -6,8 +6,10 @@ two arms, so the gap in event-level F1 (at the threshold frozen in selection) an
 AUC-PR is the contribution of the FFT features. A seed's value is the macro mean over entities;
 the spread reported is the sample standard deviation over seeds.
 
-The loop is entity-major. A real entity's runner caches its fitted pipelines and their features
-(2 to 3 GB), so the runners of one entity are released before the next entity is loaded.
+The loop is entity-major, and on each entity every selection (every seed, model and arm) is made
+before the first test label is read, so every frozen threshold predates every label read. A
+real entity's runner caches its fitted pipelines and their features (2 to 3 GB), so the runners
+of one entity are released before the next entity is loaded.
 """
 
 from __future__ import annotations
@@ -21,7 +23,8 @@ import numpy as np
 
 from tsguard.data.labels import LabelAudit
 from tsguard.data.smd import EntityData
-from tsguard.experiment.runner import EntityRunner, RunConfig, evaluate_selection
+from tsguard.eval.protocols import ProtocolParams
+from tsguard.experiment.runner import EntityRunner, RunConfig, Selection, evaluate_selection
 from tsguard.features.specs import FEATURE_SPECS, specs_without
 from tsguard.models import FEATURE_MODELS, Params
 
@@ -94,8 +97,9 @@ def run_ablation(
 
     For each entity, in order: load it once under a fresh `LabelAudit`, build one runner with
     the full feature registry and one without the ``fft`` family (both on that entity's data
-    and audit), then for each seed and model select a configuration and score it on the test
-    labels in both arms. The runners are released before the next entity is loaded.
+    and audit), select a configuration for every seed and model in both arms, check that no
+    test label has been read, and only then score all the selections on the test labels. The
+    runners are released before the next entity is loaded.
 
     Args:
         entities: Names of the entities to run, each passed to ``loader``.
@@ -105,7 +109,7 @@ def run_ablation(
         config: Settings of the runs; its ``seed`` is not used, the ``seeds`` are.
         models: Models to ablate: only models that read the engineered features, because the
             others never see the FFT features and both arms would be the same run.
-        progress: Called with one line after each entity, seed and model.
+        progress: Called with one line per entity, seed and model, as its selections are scored.
 
     Returns:
         One summary per model, keyed by its name, in the order of ``models``.
@@ -114,6 +118,8 @@ def run_ablation(
         ValueError: ``entities``, ``seeds`` or ``models`` is empty, a model is not a feature
             model or has no entry in ``params``, or the F1 without the FFT features of some
             model and seed is 0, which leaves the relative change undefined.
+        RuntimeError: A test label was read, or a threshold was frozen after a read, before
+            the selections of an entity were all made.
     """
     entity_names, seed_list, model_list = tuple(entities), tuple(seeds), tuple(models)
     _check_arguments(entity_names, seed_list, model_list, params)
@@ -171,12 +177,21 @@ def _run_entity(
     models: tuple[str, ...],
     progress: Callable[[str], None],
 ) -> dict[_Cell, tuple[_Score, _Score]]:
-    """Run both arms for every seed and model on one entity.
+    """Run both arms for every seed and model on one entity, selecting before any label read.
+
+    Phase 1 makes every selection, in both arms, and so freezes every threshold; phase 2 then
+    reads the test labels and scores them. Interleaving the two would freeze later thresholds
+    after the labels had been read, which the audit's claim (every threshold is frozen before
+    the first read) does not allow.
 
     The runners are locals of this function, so they are unreachable once it returns.
 
     Returns:
         The ``(with FFT, without FFT)`` scores of each ``(model, seed)``.
+
+    Raises:
+        RuntimeError: A test label was read, or a threshold was frozen after one was, before
+            phase 2 began.
     """
     audit = LabelAudit()
     data = loader(name, audit)
@@ -184,33 +199,49 @@ def _run_entity(
         EntityRunner(data, audit, config, specs=FEATURE_SPECS),
         EntityRunner(data, audit, config, specs=specs_without(ABLATED_FAMILY)),
     )
-    out: dict[_Cell, tuple[_Score, _Score]] = {}
+    selections: dict[_Cell, tuple[Selection, Selection]] = {}
     for seed in seeds:
         for model in models:
-            with_fft, without_fft = (
-                _score(runner, data, audit, config, model, params[model], seed) for runner in arms
-            )
-            out[(model, seed)] = (with_fft, without_fft)
-            progress(
-                f"{name} seed={seed} {model}: F1 {with_fft.f1:.4f} with FFT, "
-                f"{without_fft.f1:.4f} without"
-            )
+            full, reduced = (runner.select(model, params[model], seed=seed) for runner in arms)
+            selections[(model, seed)] = (full, reduced)
+        # Call EntityRunner.drop_seed_caches(seed) here once it is committed: the seed is done.
+    _check_selected_before_reading(name, audit, selections)
+    out: dict[_Cell, tuple[_Score, _Score]] = {}
+    for (model, seed), pair in selections.items():
+        with_fft, without_fft = (
+            _score(selection, data, audit, config.protocol) for selection in pair
+        )
+        out[(model, seed)] = (with_fft, without_fft)
+        progress(
+            f"{name} seed={seed} {model}: F1 {with_fft.f1:.4f} with FFT, "
+            f"{without_fft.f1:.4f} without"
+        )
     return out
 
 
+def _check_selected_before_reading(
+    name: str, audit: LabelAudit, selections: dict[_Cell, tuple[Selection, Selection]]
+) -> None:
+    """Raise RuntimeError if a label was read, or a threshold frozen after a read, so far."""
+    if audit.reads != 0:
+        raise RuntimeError(
+            f"{name}: {audit.reads} test-label reads happened during selection; every "
+            f"threshold must be frozen before the first read"
+        )
+    for (model, seed), pair in selections.items():
+        for selection in pair:
+            if selection.threshold.reads_before != 0:
+                raise RuntimeError(
+                    f"{name}: the threshold of model {model!r}, seed {seed} was frozen after "
+                    f"{selection.threshold.reads_before} test-label reads"
+                )
+
+
 def _score(
-    runner: EntityRunner,
-    data: EntityData,
-    audit: LabelAudit,
-    config: RunConfig,
-    model: str,
-    params: Params,
-    seed: int,
+    selection: Selection, data: EntityData, audit: LabelAudit, protocol: ProtocolParams
 ) -> _Score:
-    """Select without labels, then read the test labels once and return the event-level scores."""
-    selection = runner.select(model, params, seed=seed)
-    evaluation = evaluate_selection(selection, data.labels, audit, config.protocol)
-    event = evaluation.protocols["event_level"]
+    """Read the test labels once and return the event-level scores of the selection."""
+    event = evaluate_selection(selection, data.labels, audit, protocol).protocols["event_level"]
     return _Score(f1=event.f1, auc_pr=event.auc_pr)
 
 
