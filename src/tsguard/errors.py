@@ -39,6 +39,10 @@ class ChecksumError(TsguardError):
     """A file on disk does not match the checksum pinned for it."""
 
 
+class FetchError(TsguardError):
+    """A dataset file could not be downloaded; the message names the file and the URL."""
+
+
 class LeakageError(TsguardError):
     """A leakage guard detected information flowing from the future or from labels.
 

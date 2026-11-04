@@ -10,6 +10,7 @@ from tsguard.errors import (
     GUARD_SPLIT,
     ChecksumError,
     ContractError,
+    FetchError,
     FoldBoundaryError,
     LabelAccessError,
     LeakageError,
@@ -29,6 +30,7 @@ def test_all_errors_share_one_base():
     for cls in (
         ContractError,
         ChecksumError,
+        FetchError,
         LeakageError,
         FoldBoundaryError,
         SplitOrderError,
@@ -87,3 +89,18 @@ def test_leakage_errors_survive_a_pickle_round_trip(err):
     assert str(clone) == str(err)
     assert clone.guard == err.guard
     assert clone.detail == err.detail
+
+
+@pytest.mark.parametrize(
+    "err",
+    [
+        ContractError("column 3 out of range"),
+        ChecksumError("train/machine-1-1.txt: expected 1 bytes"),
+        FetchError("train/machine-1-1.txt: could not download http://example.test/x"),
+    ],
+    ids=lambda err: type(err).__name__,
+)
+def test_plain_errors_survive_a_pickle_round_trip(err):
+    clone = pickle.loads(pickle.dumps(err))
+    assert type(clone) is type(err)
+    assert str(clone) == str(err)

@@ -18,7 +18,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Final
 
-from tsguard.errors import ChecksumError, ContractError
+from tsguard.errors import ChecksumError, ContractError, FetchError
 
 SMD_COMMIT: Final = "7fb0e0acf89ea49908896bcc9f9e80fcfff6baf4"
 """OmniAnomaly commit that SMD is read from."""
@@ -145,6 +145,8 @@ def fetch(
 
     Raises:
         ValueError: If a name in ``entities`` is not an SMD machine.
+        FetchError: If the opener raises an ``OSError`` (``URLError``, ``HTTPError`` and
+            timeouts are all ``OSError``); the message names the file and the URL.
         ChecksumError: If a download does not match the manifest. The ``.part`` file is
             deleted first.
     """
@@ -182,7 +184,7 @@ def verify(entities: Sequence[str] = ENTITIES, *, dest: Path | None = None) -> N
         problem = _mismatch(target, entry)
         if problem is not None:
             target.unlink()
-            raise ChecksumError(problem)
+            raise ChecksumError(f"{entry.path} in {root}: {problem}; deleted")
 
 
 def _check_entities(entities: Sequence[str]) -> None:
@@ -214,7 +216,7 @@ def _mismatch(path: Path, entry: FileEntry) -> str | None:
     if size == entry.size and digest == entry.sha256:
         return None
     return (
-        f"{entry.path}: expected {entry.size} bytes with sha256 {entry.sha256}, "
+        f"expected {entry.size} bytes with sha256 {entry.sha256}, "
         f"got {size} bytes with sha256 {digest}"
     )
 
@@ -226,9 +228,14 @@ def _matches(path: Path, entry: FileEntry) -> bool:
 def _download(entry: FileEntry, target: Path, opener: Opener) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     part = target.with_name(f"{target.name}.part")
-    part.write_bytes(opener(source_url(entry.path)))
+    url = source_url(entry.path)
+    try:
+        body = opener(url)
+    except OSError as error:
+        raise FetchError(f"{entry.path}: could not download {url}: {error}") from error
+    part.write_bytes(body)
     problem = _mismatch(part, entry)
     if problem is not None:
         part.unlink()
-        raise ChecksumError(problem)
+        raise ChecksumError(f"{entry.path}: {problem}")
     os.replace(part, target)

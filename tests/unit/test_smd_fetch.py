@@ -7,7 +7,9 @@ import os
 import subprocess
 import sys
 import threading
+import urllib.error
 import urllib.request
+from email.message import Message
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +28,7 @@ from tsguard.data.smd import (
     urllib_opener,
     verify,
 )
-from tsguard.errors import ChecksumError, ContractError
+from tsguard.errors import ChecksumError, ContractError, FetchError
 
 ENTITY = "machine-1-1"
 TRAIN_PATH = f"train/{ENTITY}.txt"
@@ -71,6 +73,12 @@ def fake_manifest(
 @pytest.fixture
 def fake_opener(served: dict[str, bytes]) -> FakeOpener:
     return FakeOpener({source_url(path): body for path, body in served.items()})
+
+
+def _populate(root: Path, served: dict[str, bytes]) -> None:
+    for path, body in served.items():
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_bytes(body)
 
 
 def test_manifest_lists_84_files_for_28_entities():
@@ -140,9 +148,7 @@ def test_size_mismatch_is_reported_even_when_the_digest_matches(
 
 
 def test_truncated_file_is_removed_and_refetched(tmp_path, served, fake_manifest, fake_opener):
-    for path, body in served.items():
-        (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / path).write_bytes(body)
+    _populate(tmp_path, served)
     (tmp_path / TRAIN_PATH).write_bytes(served[TRAIN_PATH][: len(served[TRAIN_PATH]) // 2])
 
     with pytest.raises(ChecksumError, match=TRAIN_PATH):
@@ -152,6 +158,69 @@ def test_truncated_file_is_removed_and_refetched(tmp_path, served, fake_manifest
     fetch([ENTITY], dest=tmp_path, opener=fake_opener)
     assert fake_opener.urls == [source_url(TRAIN_PATH)]
     assert (tmp_path / TRAIN_PATH).read_bytes() == served[TRAIN_PATH]
+
+
+def test_verify_deletes_only_the_mismatching_file(tmp_path, served, fake_manifest):
+    test_path = f"test/{ENTITY}.txt"
+    label_path = f"test_label/{ENTITY}.txt"
+    _populate(tmp_path, served)
+    (tmp_path / test_path).write_bytes(b"corrupt")
+
+    with pytest.raises(ChecksumError, match=test_path):
+        verify([ENTITY], dest=tmp_path)
+
+    assert (tmp_path / TRAIN_PATH).read_bytes() == served[TRAIN_PATH]
+    assert not (tmp_path / test_path).exists()
+    assert (tmp_path / label_path).read_bytes() == served[label_path]
+
+
+def test_verify_mismatch_names_the_cache_root_and_says_the_file_was_deleted(
+    tmp_path, served, fake_manifest
+):
+    _populate(tmp_path, served)
+    (tmp_path / TRAIN_PATH).write_bytes(b"corrupt")
+
+    with pytest.raises(ChecksumError) as excinfo:
+        verify([ENTITY], dest=tmp_path)
+
+    message = str(excinfo.value)
+    assert f"{TRAIN_PATH} in {tmp_path}: expected" in message
+    assert message.endswith("; deleted")
+    assert fake_manifest[TRAIN_PATH].sha256 in message
+    assert hashlib.sha256(b"corrupt").hexdigest() in message
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        urllib.error.URLError("connection refused"),
+        urllib.error.HTTPError("http://example.test/x", 404, "Not Found", Message(), None),
+        TimeoutError("timed out"),
+    ],
+    ids=lambda failure: type(failure).__name__,
+)
+def test_an_opener_failure_becomes_a_fetch_error_naming_the_file_and_url(
+    tmp_path, fake_manifest, failure
+):
+    def failing_opener(url: str) -> bytes:
+        raise failure
+
+    with pytest.raises(FetchError) as excinfo:
+        fetch([ENTITY], dest=tmp_path, opener=failing_opener)
+
+    message = str(excinfo.value)
+    assert TRAIN_PATH in message
+    assert source_url(TRAIN_PATH) in message
+    assert excinfo.value.__cause__ is failure
+    assert not [path for path in tmp_path.rglob("*") if path.is_file()]
+
+
+def test_an_opener_bug_is_not_disguised_as_a_fetch_error(tmp_path, fake_manifest):
+    def buggy_opener(url: str) -> bytes:
+        raise RuntimeError("bug in the opener")
+
+    with pytest.raises(RuntimeError, match="bug in the opener"):
+        fetch([ENTITY], dest=tmp_path, opener=buggy_opener)
 
 
 def test_a_crash_before_the_move_leaves_nothing_under_the_final_name(
@@ -178,9 +247,13 @@ def test_fetch_replaces_a_corrupt_file_without_verify(tmp_path, served, fake_man
     assert (tmp_path / TRAIN_PATH).read_bytes() == served[TRAIN_PATH]
 
 
-def test_verify_accepts_a_complete_download(tmp_path, fake_manifest, fake_opener):
+def test_verify_accepts_a_complete_download_and_leaves_it_untouched(
+    tmp_path, served, fake_manifest, fake_opener
+):
     fetch([ENTITY], dest=tmp_path, opener=fake_opener)
     verify([ENTITY], dest=tmp_path)
+    for path, body in served.items():
+        assert (tmp_path / path).read_bytes() == body
 
 
 def test_verify_reports_a_missing_file(tmp_path, fake_manifest):
