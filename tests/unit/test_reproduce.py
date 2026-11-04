@@ -5,9 +5,12 @@ import re
 import subprocess
 import sys
 import weakref
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
+from typing import Any
 
 import numpy as np
 import pytest
@@ -25,6 +28,7 @@ from tsguard.data.labels import LabelAudit, Phase
 from tsguard.data.smd import ENTITIES, SMD_COMMIT, EntityData
 from tsguard.eval.protocols import PROTOCOLS
 from tsguard.experiment import reproduce as reproduce_module
+from tsguard.experiment import runner as runner_module
 from tsguard.experiment.ablation import run_ablation
 from tsguard.experiment.reproduce import (
     FULL,
@@ -39,11 +43,73 @@ from tsguard.experiment.reproduce import (
 )
 from tsguard.experiment.runner import EntityRunner, RunConfig, Selection
 from tsguard.experiment.tracking import MemoryTracker
-from tsguard.experiment.tuning import FINAL_EXPERIMENT, TUNING_EXPERIMENT
-from tsguard.models import MODEL_NAMES
+from tsguard.experiment.tuning import FINAL_EXPERIMENT, TUNING_EXPERIMENT, TuningResult
+from tsguard.features.causality import assert_causal, assert_fit_ignores_future
+from tsguard.models import FEATURE_MODELS, MODEL_NAMES
 from tsguard.models.space import DEFAULT_PARAMS
 from tsguard.repro.claims import publishable_problems
 from tsguard.repro.report import Metrics, best_model, read_metrics
+from tsguard.repro.seeding import configure_runtime
+
+
+class CausalChecks:
+    """Records the causality checks the runners make, as ``(entity, model, check)``.
+
+    The checks are `assert_causal` (the transform of the test rows, the scores) and
+    `assert_fit_ignores_future` (the fit), called from `EntityRunner._check_causal`. The
+    originals still run, so a leak would still be caught. A runner subclass reports which
+    entity and model it is checking by wrapping ``_check_causal`` in `visit`.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str]] = []
+        self._at: tuple[EntityRunner, str] | None = None
+
+    def install(self, patch: pytest.MonkeyPatch) -> None:
+        def spy_causal(fn: Callable[[np.ndarray], Any], X: np.ndarray, **kwargs: Any) -> None:
+            # the transform check gets every row of the entity, the score check only the test rows
+            runner, model = self._where()
+            data = runner._data
+            kind = "transform" if len(X) == data.train_end + data.n_test else "score"
+            self.calls.append((data.name, model, kind))
+            assert_causal(fn, X, **kwargs)
+
+        def spy_fit(fn: Callable[[np.ndarray], str], X: np.ndarray, **kwargs: Any) -> None:
+            runner, model = self._where()
+            self.calls.append((runner._data.name, model, "fit"))
+            assert_fit_ignores_future(fn, X, **kwargs)
+
+        patch.setattr(runner_module, "assert_causal", spy_causal)
+        patch.setattr(runner_module, "assert_fit_ignores_future", spy_fit)
+
+    def _where(self) -> tuple[EntityRunner, str]:
+        assert self._at is not None, "a causality check ran outside EntityRunner._check_causal"
+        return self._at
+
+    @contextmanager
+    def visit(self, runner: EntityRunner, model: str) -> Iterator[None]:
+        self._at = (runner, model)
+        try:
+            yield
+        finally:
+            self._at = None
+
+
+def expected_causal_checks(entity: str) -> list[tuple[str, str, str]]:
+    """What selecting every model on one entity must check, in order.
+
+    The transform and the fit are checked once per input kind, on the first model of the kind;
+    the scores are checked for every model.
+    """
+    expected: list[tuple[str, str, str]] = []
+    seen: set[bool] = set()
+    for model in MODEL_NAMES:
+        takes_features = model in FEATURE_MODELS
+        if takes_features not in seen:
+            seen.add(takes_features)
+            expected += [(entity, model, "transform"), (entity, model, "fit")]
+        expected.append((entity, model, "score"))
+    return expected
 
 
 @dataclass
@@ -62,6 +128,7 @@ class TinyRun:
     # what the output directory held when the ablation started
     files_at_ablation: list[str] = field(default_factory=list)
     partial_at_ablation: Metrics | None = None
+    causal: CausalChecks = field(default_factory=CausalChecks)
 
 
 @pytest.fixture(scope="module")
@@ -80,6 +147,10 @@ def tiny_run(tmp_path_factory: pytest.TempPathFactory) -> TinyRun:
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             refs.append(weakref.ref(self))
+
+        def _check_causal(self, model, *args, **kwargs):
+            with run.causal.visit(self, model):
+                super()._check_causal(model, *args, **kwargs)
 
     def loader(name: str, audit: LabelAudit) -> EntityData:
         # No gc.collect() here: reproduce itself must have released the earlier runners.
@@ -104,6 +175,7 @@ def tiny_run(tmp_path_factory: pytest.TempPathFactory) -> TinyRun:
         return run_ablation(entities, **kwargs)
 
     with pytest.MonkeyPatch.context() as patch:
+        run.causal.install(patch)
         patch.setattr(reproduce_module, "EntityRunner", SpyRunner)
         patch.setattr(reproduce_module, "run_ablation", spy_ablation)
         patch.setattr(reproduce_module, "best_model", spy_best_model)
@@ -216,6 +288,48 @@ def test_ablation_gets_the_tuned_feature_params_and_skips_the_causal_check(tiny_
     config = call["config"]
     assert config == dataclasses.replace(TINY.run, causal_check=False)
     assert TINY.run.causal_check  # the selection phase keeps the check on
+
+
+@pytest.mark.slow
+def test_reproduce_runs_every_causality_check_on_every_selected_entity(tiny_run):
+    # Not on the tuning runner, which selects nothing, and not in the ablation, which skips them.
+    expected = [*expected_causal_checks("synthetic-0"), *expected_causal_checks("synthetic-1")]
+    assert tiny_run.causal.calls == expected
+
+
+@pytest.fixture
+def one_thread() -> Iterator[None]:
+    """Run torch on one thread for a test, then give the process back its setting."""
+    import torch
+
+    threads = torch.get_num_threads()
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    configure_runtime(threads=1)
+    yield
+    torch.set_num_threads(threads)
+    torch.use_deterministic_algorithms(deterministic)
+
+
+def test_selecting_an_entity_runs_every_causality_check(monkeypatch, one_thread):
+    # The selection phase of `reproduce` without the rest: a runner configured with the profile's
+    # settings must check every input kind once and every model, whatever else the run does.
+    checks = CausalChecks()
+    checks.install(monkeypatch)
+
+    class SpyRunner(EntityRunner):
+        def _check_causal(self, model, *args, **kwargs):
+            with checks.visit(self, model):
+                super()._check_causal(model, *args, **kwargs)
+
+    monkeypatch.setattr(reproduce_module, "EntityRunner", SpyRunner)
+    tuned = {
+        model: TuningResult(model, dict(DEFAULT_PARAMS[model]), 0.0, ()) for model in MODEL_NAMES
+    }
+    record = reproduce_module._select_entity(
+        "synthetic-0", TINY, load_synthetic, tuned, MemoryTracker(), lambda line: None
+    )
+    assert set(record.selections) == set(MODEL_NAMES)
+    assert checks.calls == expected_causal_checks("synthetic-0")
 
 
 HEADLINE_LINE = re.compile(

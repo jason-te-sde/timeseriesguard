@@ -18,13 +18,22 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from tests.conftest import make_entity
+from tests.leakage.defects import CENTERED_ROLLING
 from tests.unit.test_report_and_claims import tiny_metrics
 from tsguard.data.labels import LabelAudit
 from tsguard.data.smd import SMD_COMMIT, EntityData
 from tsguard.data.splits import walk_forward_folds
-from tsguard.errors import ChecksumError, ConfigurationError, ContractError, LeakageError
+from tsguard.errors import (
+    GUARD_CAUSAL,
+    ChecksumError,
+    ConfigurationError,
+    ContractError,
+    LeakageError,
+)
+from tsguard.experiment.reproduce import FULL
 from tsguard.experiment.runner import EntityRunner, RunConfig, Selection
 from tsguard.features.pipeline import FeaturePipeline
+from tsguard.features.specs import FEATURE_SPECS
 from tsguard.models.iforest import IsolationForestDetector
 from tsguard.models.space import DEFAULT_PARAMS
 from tsguard.repro.report import write_metrics
@@ -765,6 +774,61 @@ def test_bundle_command_writes_a_loadable_bundle(tmp_path, monkeypatch):
     assert bundle.params == dict(DEFAULT_PARAMS["iforest"])
     assert digest in summary
     assert str(out) in summary
+
+
+def _load_synthetic_entity(name: str, *, audit: LabelAudit, dest: Path | None = None) -> EntityData:
+    return make_entity(n_train=N_TRAIN, n_test=N_TEST, audit=audit, name=name)
+
+
+def test_bundle_command_runs_the_causality_checks(tmp_path, monkeypatch):
+    # The bundle is the experiment's selection, so a feature that reads the future must stop it
+    # the way it stops `reproduce`. The runner is handed the leak the way a bad spec list would.
+    class CenteredRunner(EntityRunner):
+        def __init__(self, data, audit, config=RunConfig(), **kwargs):  # noqa: B008
+            specs = (*FEATURE_SPECS[:3], CENTERED_ROLLING)
+            super().__init__(data, audit, config, specs=specs, **kwargs)
+
+    monkeypatch.setattr(commands, "load_entity", _load_synthetic_entity)
+    monkeypatch.setattr(bundle_module, "EntityRunner", CenteredRunner)
+    out = tmp_path / "bundle.joblib"
+    with pytest.raises(LeakageError) as caught:
+        commands.bundle_command(
+            entity="machine-1-1",
+            model="zscore",
+            metrics_path=tmp_path / "missing.json",
+            default_params=True,
+            out=out,
+        )
+    assert caught.value.guard == GUARD_CAUSAL
+    assert not out.exists()  # nothing was bundled, and no sidecar either
+    assert not Path(str(out) + ".sha256").exists()
+
+
+def test_the_bundle_is_selected_with_the_config_of_the_full_profile(tmp_path, monkeypatch):
+    # `bundle_command` selects with RunConfig(), which is what the full run selected with, so a
+    # bundle reproduces the experiment's selection and keeps every causality check on.
+    seen: list[RunConfig] = []
+
+    class StopError(Exception):
+        pass
+
+    def stop(data, audit, model, params, *, config):
+        seen.append(config)
+        raise StopError
+
+    monkeypatch.setattr(commands, "load_entity", _load_synthetic_entity)
+    monkeypatch.setattr(commands, "build_bundle", stop)
+    with pytest.raises(StopError):
+        commands.bundle_command(
+            entity="machine-1-1",
+            model="zscore",
+            metrics_path=tmp_path / "missing.json",
+            default_params=True,
+            out=tmp_path / "bundle.joblib",
+        )
+    assert seen == [RunConfig()]
+    assert FULL.run == RunConfig()
+    assert seen[0].causal_check
 
 
 def test_serve_command_hands_the_app_to_uvicorn(iforest, monkeypatch):
