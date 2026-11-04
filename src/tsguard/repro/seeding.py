@@ -8,11 +8,12 @@ one purpose never shifts the random stream of another.
 from __future__ import annotations
 
 import hashlib
+from typing import Final
 
 import torch
 
-_SEED_BYTES = 4  # seeds are 32-bit, which every numpy and torch seeding API accepts
-_SEPARATOR = "|"
+_SEED_BYTES: Final = 4  # seeds are 32-bit, which every numpy and torch seeding API accepts
+_SEPARATOR: Final = "|"
 
 
 def derive_seed(root: int, *labels: str | int) -> int:

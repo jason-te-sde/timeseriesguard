@@ -3815,7 +3815,7 @@ dev = [
     { name = "httpx2", specifier = ">=2.0.0" },
     { name = "mypy" },
     { name = "pandas-stubs" },
-    { name = "pytest" },
+    { name = "pytest", specifier = ">=8" },
     { name = "pytest-cov" },
     { name = "ruff" },
 ]

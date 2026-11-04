@@ -30,7 +30,8 @@ tsguard = "tsguard.cli:main"
 
 [dependency-groups]
 dev = [
-    "pytest",
+    # 8: tests/conftest.py uses @pytest.hookimpl(wrapper=True), which older releases lack.
+    "pytest>=8",
     "pytest-cov",
     "ruff",
     "mypy",
