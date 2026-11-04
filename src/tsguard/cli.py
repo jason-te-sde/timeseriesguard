@@ -255,9 +255,10 @@ def _bundle(args: argparse.Namespace) -> int:
             default_params=args.default_params,
             out=args.out,
         )
-    except (ValueError, OSError) as error:
-        # The failures bundle_command documents: no metrics file, an unusable one, a model the
-        # metrics do not hold, a data file that is not there.
+    except OSError as error:
+        # A TsguardError reaches main as it is; a bare ValueError is a bug and keeps its
+        # traceback. What is left to catch here is the file system: no metrics file, an
+        # unwritable output, a data file that is not there.
         raise CliError(" ".join(str(error).split())) from error
     print(summary)
     return 0
@@ -266,6 +267,6 @@ def _bundle(args: argparse.Namespace) -> int:
 def _serve(args: argparse.Namespace) -> int:
     try:
         serve_command(bundle=args.bundle, host=args.host, port=args.port)
-    except (ValueError, OSError) as error:
+    except OSError as error:
         raise CliError(" ".join(str(error).split())) from error
     return 0

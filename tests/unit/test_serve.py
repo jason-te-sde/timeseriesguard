@@ -22,7 +22,7 @@ from tests.unit.test_report_and_claims import tiny_metrics
 from tsguard.data.labels import LabelAudit
 from tsguard.data.smd import SMD_COMMIT, EntityData
 from tsguard.data.splits import walk_forward_folds
-from tsguard.errors import ChecksumError, ContractError, LeakageError
+from tsguard.errors import ChecksumError, ConfigurationError, ContractError, LeakageError
 from tsguard.experiment.runner import EntityRunner, RunConfig, Selection
 from tsguard.features.pipeline import FeaturePipeline
 from tsguard.models.iforest import IsolationForestDetector
@@ -715,17 +715,28 @@ def test_resolve_tuned_params_need_a_metrics_file(tmp_path):
 
 
 def test_resolve_refuses_a_model_the_metrics_do_not_hold(metrics_file):
-    with pytest.raises(ValueError, match="lstm_ae_v2"):
+    with pytest.raises(ConfigurationError, match="lstm_ae_v2"):
         commands.resolve_configuration(
             model="lstm_ae_v2", metrics_path=metrics_file, default_params=False
         )
 
 
 def test_resolve_refuses_an_unknown_model_with_default_params(tmp_path):
-    with pytest.raises(ValueError, match=r"unknown model 'nope'.*iforest"):
+    with pytest.raises(ConfigurationError, match=r"unknown model 'nope'.*iforest"):
         commands.resolve_configuration(
             model="nope", metrics_path=tmp_path / "missing.json", default_params=True
         )
+
+
+@pytest.mark.parametrize(
+    "text", ["{not json", '{"schema_version": 1}'], ids=["not-json", "wrong-schema"]
+)
+def test_resolve_refuses_an_unusable_metrics_file_with_a_one_line_message(tmp_path, text):
+    path = tmp_path / "metrics.json"
+    path.write_text(text)
+    with pytest.raises(ConfigurationError, match=r"metrics\.json") as caught:
+        commands.resolve_configuration(model=None, metrics_path=path, default_params=False)
+    assert "\n" not in str(caught.value)
 
 
 def test_bundle_command_writes_a_loadable_bundle(tmp_path, monkeypatch):

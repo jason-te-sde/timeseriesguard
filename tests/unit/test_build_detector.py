@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 import tsguard.models
+from tsguard.errors import ConfigurationError
 from tsguard.models import MODEL_NAMES, build_detector
 from tsguard.models.autoencoders import AutoencoderDetector
 from tsguard.models.iforest import IsolationForestDetector
@@ -39,22 +40,29 @@ from tsguard.models.zscore import ZScoreDetector
 )
 def test_a_parameter_of_the_wrong_type_is_refused_at_build_time(model, key, bad, expected):
     params = {**DEFAULT_PARAMS[model], key: bad}
-    with pytest.raises(ValueError, match=rf"model '{model}' parameter '{key}'.*{expected}"):
+    with pytest.raises(ConfigurationError, match=rf"model '{model}' parameter '{key}'.*{expected}"):
         build_detector(model, params, seed=0)
 
 
 def test_a_zscore_k_of_eight_point_zero_fails_in_build_not_in_score():
-    with pytest.raises(ValueError, match=r"model 'zscore' parameter 'k' must be an int"):
+    with pytest.raises(ConfigurationError, match=r"model 'zscore' parameter 'k' must be an int"):
         build_detector("zscore", {"aggregation": "topk", "k": 8.0}, seed=0)
 
 
 def test_an_unknown_aggregation_lists_the_allowed_names():
-    with pytest.raises(ValueError, match=r"'aggregation' must be one of .*'mean'.*'max'.*'topk'"):
+    with pytest.raises(
+        ConfigurationError, match=r"'aggregation' must be one of .*'mean'.*'max'.*'topk'"
+    ):
         build_detector("zscore", {"aggregation": "median"}, seed=0)
 
 
+def test_an_unknown_model_is_a_configuration_error_that_lists_the_valid_names():
+    with pytest.raises(ConfigurationError, match=r"unknown model 'nope'.*zscore.*lstm_ae"):
+        build_detector("nope", {}, seed=0)
+
+
 def test_an_unknown_key_is_still_reported_before_a_type_problem():
-    with pytest.raises(ValueError, match="has no parameter 'q'"):
+    with pytest.raises(ConfigurationError, match="has no parameter 'q'"):
         build_detector("zscore", {"q": 1, "k": 8.0}, seed=0)
 
 

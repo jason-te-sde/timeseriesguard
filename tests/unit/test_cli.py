@@ -7,13 +7,15 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
+from sklearn.ensemble import IsolationForest
 
 from tests.unit.test_report_and_claims import README_TEXT, tiny_metrics, write_runs_csv
 from tsguard import cli
 from tsguard.cli import main
 from tsguard.data.labels import LabelAudit
-from tsguard.errors import ChecksumError, ContractError, FetchError
+from tsguard.errors import ChecksumError, ConfigurationError, ContractError, FetchError
 from tsguard.experiment.reproduce import SMOKE
 from tsguard.experiment.tuning import FINAL_EXPERIMENT, TUNING_EXPERIMENT
 from tsguard.repro.report import write_metrics
@@ -406,7 +408,7 @@ def test_serve_passes_host_and_port_through(monkeypatch, tmp_path):
         ChecksumError("bundle.joblib: sha256 does not match its sidecar"),
         ContractError("bundle.joblib: not a tsguard bundle"),
         FileNotFoundError("reports/metrics.json does not exist, so there is nothing to tune from"),
-        ValueError("unknown model 'nope'; valid names: zscore, iforest"),
+        ConfigurationError("unknown model 'nope'; valid names: zscore, iforest"),
     ],
     ids=lambda error: type(error).__name__,
 )
@@ -420,6 +422,34 @@ def test_bundle_and_serve_failures_are_a_message_and_exit_1(monkeypatch, capsys,
         assert main(argv) == 1
         err = capsys.readouterr().err
         assert err == f"tsguard: error: {error}\n"
+
+
+def sklearn_invalid_parameter_error() -> ValueError:
+    """Return the ValueError scikit-learn raises for a parameter it rejects at fit time."""
+    try:
+        IsolationForest(n_estimators=-1).fit(np.zeros((4, 2)))
+    except ValueError as error:
+        return error
+    raise AssertionError("scikit-learn accepted n_estimators=-1")
+
+
+@pytest.mark.parametrize("command", ["bundle", "serve"])
+@pytest.mark.parametrize(
+    "bug",
+    [ValueError("a bug"), sklearn_invalid_parameter_error()],
+    ids=["ValueError", "InvalidParameterError"],
+)
+def test_a_value_error_that_is_not_a_tsguard_error_is_a_bug_and_keeps_its_traceback(
+    monkeypatch, command, bug
+):
+    def broken(**kwargs):
+        raise bug
+
+    monkeypatch.setattr(cli, f"{command}_command", broken)
+    argv = BUNDLE_ARGV if command == "bundle" else ["serve", "--bundle", "b.joblib"]
+    with pytest.raises(ValueError, match=re.escape(str(bug))) as caught:
+        main(argv)
+    assert caught.value is bug
 
 
 def test_a_bug_in_a_command_keeps_its_traceback(monkeypatch):

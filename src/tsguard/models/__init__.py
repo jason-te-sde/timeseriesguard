@@ -12,6 +12,7 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any, Final, get_args
 
+from tsguard.errors import ConfigurationError
 from tsguard.models.autoencoders import AutoencoderDetector, Kind
 from tsguard.models.base import Detector
 from tsguard.models.iforest import IsolationForestDetector
@@ -60,11 +61,12 @@ def build_detector(
         The detector, ready for ``fit``.
 
     Raises:
-        ValueError: ``name`` is not a registered model, ``params`` holds a key the model does
-            not take, a value has the wrong type (an integer parameter must be an ``int``, not
-            a ``float`` such as ``8.0`` and not a ``bool``; a real parameter must be a number;
-            a name parameter must be one of the allowed strings), or the model rejects a value
-            of the right type.
+        ConfigurationError: ``name`` is not a registered model, ``params`` holds a key the
+            model does not take, or a value has the wrong type (an integer parameter must be
+            an ``int``, not a ``float`` such as ``8.0`` and not a ``bool``; a real parameter
+            must be a number; a name parameter must be one of the allowed strings). It is a
+            `ValueError` as well.
+        ValueError: The model rejects a value of the right type, such as ``k < 1``.
     """
     kwargs: dict[str, Any] = dict(params)
     match name:
@@ -82,7 +84,7 @@ def build_detector(
             return _build_autoencoder("lstm", kwargs, "hidden", seed=seed, epochs=epochs)
         case _:
             valid = ", ".join(MODEL_NAMES)
-            raise ValueError(f"unknown model {name!r}; valid names: {valid}")
+            raise ConfigurationError(f"unknown model {name!r}; valid names: {valid}")
 
 
 def _build_autoencoder(
@@ -99,14 +101,14 @@ def _check_params(name: str, params: Params) -> None:
     types = _PARAM_TYPES[name]
     unknown = sorted(set(params) - set(types))
     if unknown:
-        raise ValueError(
+        raise ConfigurationError(
             f"model {name!r} has no parameter {', '.join(map(repr, unknown))}; "
             f"it takes: {', '.join(types)}"
         )
     for key, value in params.items():
         wanted = _wanted(types[key], value)
         if wanted is not None:
-            raise ValueError(
+            raise ConfigurationError(
                 f"model {name!r} parameter {key!r} must be {wanted}, got "
                 f"{type(value).__name__} {value!r}"
             )

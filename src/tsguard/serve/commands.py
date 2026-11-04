@@ -14,10 +14,11 @@ import uvicorn
 
 from tsguard.data.labels import LabelAudit
 from tsguard.data.smd import load_entity
+from tsguard.errors import ConfigurationError
 from tsguard.experiment.runner import RunConfig
 from tsguard.models import MODEL_NAMES, Params
 from tsguard.models.space import DEFAULT_PARAMS
-from tsguard.repro.report import read_metrics
+from tsguard.repro.report import Metrics, read_metrics
 from tsguard.repro.seeding import configure_runtime
 from tsguard.serve.app import create_app
 from tsguard.serve.bundle import build_bundle, save_bundle
@@ -48,8 +49,9 @@ def resolve_configuration(
 
     Raises:
         FileNotFoundError: The tuned parameters are wanted and ``metrics_path`` does not exist.
-        ValueError: ``model`` is not a registered model, or the metrics hold no entry for it,
-            or the metrics file is invalid.
+        ConfigurationError: ``model`` is not a registered model, or the metrics hold no entry
+            for it, or the metrics file is not a valid ``metrics.json``. It is a `ValueError`
+            as well.
     """
     exists = metrics_path.exists()
     if not exists and not default_params:
@@ -57,21 +59,29 @@ def resolve_configuration(
             f"{metrics_path} does not exist, so there are no tuned parameters to build the "
             f"bundle with; run the experiment first or use the default parameters"
         )
-    metrics = read_metrics(metrics_path) if exists else None
+    metrics = _read_metrics(metrics_path) if exists else None
     chosen = model or (metrics.headline.model if metrics is not None else FALLBACK_MODEL)
     if default_params:
         return chosen, _defaults(chosen)
     assert metrics is not None  # not exists and not default_params was refused above
     if chosen not in metrics.models:
-        raise ValueError(
+        raise ConfigurationError(
             f"{metrics_path} has no model {chosen!r}; it holds {', '.join(sorted(metrics.models))}"
         )
     return chosen, dict(metrics.models[chosen].params)
 
 
+def _read_metrics(path: Path) -> Metrics:
+    """Read a ``metrics.json``, naming the file in the one-line error of an invalid one."""
+    try:
+        return read_metrics(path)
+    except ValueError as error:
+        raise ConfigurationError(f"{path}: {' '.join(str(error).split())}") from error
+
+
 def _defaults(model: str) -> Mapping[str, int | float | str]:
     if model not in DEFAULT_PARAMS:
-        raise ValueError(f"unknown model {model!r}; valid names: {', '.join(MODEL_NAMES)}")
+        raise ConfigurationError(f"unknown model {model!r}; valid names: {', '.join(MODEL_NAMES)}")
     return dict(DEFAULT_PARAMS[model])
 
 
@@ -103,7 +113,8 @@ def bundle_command(
 
     Raises:
         FileNotFoundError: See `resolve_configuration`.
-        ValueError: See `resolve_configuration`.
+        ConfigurationError: See `resolve_configuration`, or the metrics hold a parameter the
+            model does not take or of the wrong type.
         ChecksumError: A data file does not match the pinned manifest.
     """
     chosen, params = resolve_configuration(

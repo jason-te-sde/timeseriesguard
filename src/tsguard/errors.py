@@ -31,6 +31,14 @@ class TsguardError(Exception):
     """Base class of every exception tsguard raises on purpose."""
 
 
+class ConfigurationError(TsguardError, ValueError):
+    """A model, a hyperparameter or a metrics file the user supplied cannot be used.
+
+    It is also a `ValueError`, so a caller that documented a `ValueError` for a bad model name
+    keeps working; the command line reports it as a message instead of a traceback.
+    """
+
+
 class ContractError(TsguardError):
     """An input or output violated a documented data contract (shape, dtype, range, order)."""
 

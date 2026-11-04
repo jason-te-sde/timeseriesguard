@@ -9,6 +9,7 @@ from tsguard.errors import (
     GUARD_LABELS,
     GUARD_SPLIT,
     ChecksumError,
+    ConfigurationError,
     ContractError,
     FetchError,
     FoldBoundaryError,
@@ -28,6 +29,7 @@ def test_every_leakage_error_names_its_guard():
 
 def test_all_errors_share_one_base():
     for cls in (
+        ConfigurationError,
         ContractError,
         ChecksumError,
         FetchError,
@@ -37,6 +39,14 @@ def test_all_errors_share_one_base():
         LabelAccessError,
     ):
         assert issubclass(cls, TsguardError)
+
+
+def test_a_configuration_error_is_also_a_value_error():
+    # Callers that documented a ValueError for a bad model or parameter keep working.
+    error = ConfigurationError("unknown model 'nope'")
+    assert isinstance(error, TsguardError)
+    assert isinstance(error, ValueError)
+    assert str(error) == "unknown model 'nope'"
 
 
 def test_leakage_error_message_carries_guard():
