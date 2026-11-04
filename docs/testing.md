@@ -37,7 +37,10 @@ Around the tests:
   count of label reads at selection, or a headline that is not the model with the highest
   validation objective. `tsguard claims --write` refuses the same runs, so a smoke run cannot
   reach the README.
-- The `hygiene` job rejects a commit message that carries a `Co-Authored-By:` trailer.
+- The `hygiene` job rejects a commit message that carries a `Co-Authored-By:` trailer, in every
+  commit of a pull request and in every commit a push brings (from the commit the branch pointed at
+  before the push; the first push of a branch, or one whose old tip is gone, checks the last commit
+  only). `tests/unit/test_ci_hygiene.py` runs the job's script against throwaway histories.
 
 Gaps, stated so nobody assumes otherwise:
 

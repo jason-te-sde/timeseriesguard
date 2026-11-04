@@ -91,11 +91,20 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
         run: |
+          # A push can bring many commits, and the trailer may be in any of them. The range runs
+          # from the commit the branch pointed at before the push. The first push of a branch has
+          # an all-zero `before`, and after a force push the old tip may not be in the clone:
+          # both fall back to the last commit.
           if [ "$EVENT_NAME" = "pull_request" ]; then
             messages="$(git log --format=%B "origin/${BASE_REF}..HEAD")"
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
+              && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            messages="$(git log --format=%B "${BEFORE}..${SHA}")"
           else
-            messages="$(git log -1 --format=%B HEAD)"
+            messages="$(git log -1 --format=%B "$SHA")"
           fi
           if printf '%s\n' "$messages" | grep -iE '^co-authored-by:'; then
             echo "::error::A commit message carries a Co-Authored-By trailer. Remove it before merging."
