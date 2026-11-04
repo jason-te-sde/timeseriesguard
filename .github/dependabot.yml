@@ -11,6 +11,10 @@ updates:
       all:
         patterns:
           - "*"
+      security:
+        applies-to: security-updates
+        patterns:
+          - "*"
     commit-message:
       prefix: "build"
       include: "scope"
@@ -21,6 +25,10 @@ updates:
       interval: "weekly"
     groups:
       all:
+        patterns:
+          - "*"
+      security:
+        applies-to: security-updates
         patterns:
           - "*"
     commit-message:

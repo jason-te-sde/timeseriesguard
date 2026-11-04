@@ -34,8 +34,23 @@ jobs:
           path: ~/.cache/tsguard
           key: smd-${{ hashFiles('src/tsguard/data/smd_manifest.json') }}
       - name: Fetch SMD (a no-op on a warm cache)
-        run: uv run tsguard data fetch
+        run: |
+          # The fetch is idempotent, so a transient failure (for example a 429 from
+          # raw.githubusercontent.com) is retried instead of turning the job red.
+          for attempt in 1 2 3; do
+            if uv run tsguard data fetch; then
+              exit 0
+            fi
+            echo "::warning::data fetch attempt ${attempt} of 3 failed"
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 15))
+            fi
+          done
+          exit 1
+      # The step times out before the job does (the job's 360 minutes are the hosted-runner
+      # ceiling), so the upload below still gets its 20 minutes after a run that never ends.
       - name: Reproduce the full profile
+        timeout-minutes: 340
         run: uv run tsguard reproduce --profile full --out artifacts/full
       # The directory holds metrics.json and mlflow_runs.csv, and the MLflow store beside them:
       # after a failure the store is the only trace of the runs that did finish.
