@@ -22,6 +22,7 @@ import numpy as np
 from tsguard.errors import GUARD_CAUSAL, LeakageError
 
 _COMPARE_BLOCK: Final = 4096  # rows compared at once; bounds the temporaries of the comparison
+_NUMERIC_KINDS: Final = "biufc"  # dtype kinds that np.isnan and == both handle
 
 
 def _with_noise_from(X: np.ndarray, first_row: int, rng: np.random.Generator) -> np.ndarray:
@@ -29,6 +30,19 @@ def _with_noise_from(X: np.ndarray, first_row: int, rng: np.random.Generator) ->
     perturbed = X.copy()
     perturbed[first_row:] = rng.uniform(0.0, 1.0, size=X[first_row:].shape)
     return perturbed
+
+
+def _require_floating(X: np.ndarray) -> None:
+    """Reject an input the uniform noise cannot be written into without truncation.
+
+    Raises:
+        ValueError: ``X`` does not have a floating dtype; noise in [0, 1) assigned into an
+            integer array truncates to 0, which can make the perturbation a no-op.
+    """
+    if not np.issubdtype(X.dtype, np.floating):
+        raise ValueError(
+            f"X must have a floating dtype, got {X.dtype}; noise in [0, 1) would be truncated"
+        )
 
 
 def _first_difference(before: np.ndarray, after: np.ndarray) -> tuple[int, int] | None:
@@ -80,16 +94,18 @@ def assert_causal(
         LeakageError: An output row before ``t0`` changed (guard ``assert_causal``). Its
             ``detail`` holds ``t0``, the absolute ``row`` and the ``column``, as a name when
             ``columns`` is given and as an index otherwise.
-        ValueError: ``t0`` or ``start`` is out of range, the output does not hold the
-            rows ``[start, len(X))``, the two outputs differ in shape, or ``columns`` does
-            not match the number of output columns.
+        ValueError: ``t0`` or ``start`` is out of range, ``X`` is not floating point, the
+            output does not hold the rows ``[start, len(X))``, has no columns or is not
+            numeric, the two outputs differ in shape, or ``columns`` does not match the number
+            of output columns.
     """
     n = len(X)
     if not 0 <= start < t0 < n:
         raise ValueError(
             f"t0 must satisfy 0 <= start < t0 < len(X), got t0={t0}, start={start}, len(X)={n}"
         )
-    before = np.asarray(fn(X))
+    _require_floating(X)
+    before = np.array(fn(X), copy=True)  # a fn may return a buffer it reuses on the next call
     after = np.asarray(fn(_with_noise_from(X, t0, rng)))
     if before.shape != after.shape:
         raise ValueError(
@@ -101,7 +117,12 @@ def assert_causal(
             f"fn must return a 1-D or 2-D array with the {n - start} rows [{start}, {n}), "
             f"got shape {before.shape}"
         )
+    for output in (before, after):
+        if output.dtype.kind not in _NUMERIC_KINDS:
+            raise ValueError(f"fn must return a numeric array, got dtype {output.dtype}")
     n_columns = 1 if before.ndim == 1 else before.shape[1]
+    if n_columns == 0:
+        raise ValueError("fn returned an output with no columns, so there is nothing to compare")
     if columns is not None and len(columns) != n_columns:
         raise ValueError(f"got {len(columns)} column names for {n_columns} output columns")
     cut = t0 - start
@@ -142,13 +163,15 @@ def assert_fit_ignores_future(
     Raises:
         LeakageError: The digests differ (guard ``assert_causal``); ``detail`` holds
             ``phase="fit"`` and ``end_index``.
-        ValueError: ``end_index`` is out of range, which would leave no rows to replace.
+        ValueError: ``end_index`` is out of range, which would leave no rows to replace, or
+            ``X`` is not floating point.
     """
     n = len(X)
     if not 0 < end_index < n:
         raise ValueError(
             f"end_index must satisfy 0 < end_index < len(X), got {end_index} for len(X)={n}"
         )
+    _require_floating(X)
     if fit(X) != fit(_with_noise_from(X, end_index, rng)):
         raise LeakageError(
             f"fitted state changed when rows >= {end_index} were replaced; "

@@ -6,7 +6,7 @@ import pytest
 
 from tests.conftest import make_entity
 from tsguard.errors import GUARD_CAUSAL, LeakageError
-from tsguard.features.causality import assert_causal, assert_fit_ignores_future
+from tsguard.features.causality import _COMPARE_BLOCK, assert_causal, assert_fit_ignores_future
 from tsguard.features.pipeline import FeaturePipeline
 
 
@@ -190,3 +190,60 @@ def test_fit_check_does_not_modify_the_input(rng, x100):
     before = x100.copy()
     assert_fit_ignores_future(lambda X: "digest", x100, end_index=50, rng=rng)
     np.testing.assert_array_equal(x100, before)
+
+
+def test_a_function_that_reuses_its_output_buffer_is_still_checked(rng, x100):
+    buffer = np.empty_like(x100)
+
+    def fn(X):
+        buffer[:] = centered_mean(X)
+        return buffer
+
+    with pytest.raises(LeakageError) as ei:
+        assert_causal(fn, x100, t0=50, rng=rng)
+    assert ei.value.detail["row"] == 48
+
+
+@pytest.mark.parametrize("start", [0, 100])
+def test_a_leak_first_visible_past_the_first_compare_block_is_located(rng, start):
+    t0 = _COMPARE_BLOCK + 104
+    X = rng.uniform(0.0, 1.0, size=(t0 + 1800, 3))
+
+    def leak_in_third_column(X):
+        out = X.copy()
+        out[:, 2] = centered_mean(X[:, [2]], 3)[:, 0]
+        return out[start:]
+
+    with pytest.raises(LeakageError) as ei:
+        assert_causal(leak_in_third_column, X, t0=t0, start=start, rng=rng)
+    assert ei.value.detail == {"t0": t0, "row": t0 - 1, "column": 2}
+
+
+def test_fit_that_reads_exactly_one_row_past_end_index_is_caught(rng):
+    e = make_entity()
+    with pytest.raises(LeakageError) as ei:
+        assert_fit_ignores_future(
+            lambda X: FeaturePipeline().fit(X, end_index=e.train_end + 1).state_digest(),
+            e.full,
+            end_index=e.train_end,
+            rng=rng,
+        )
+    assert ei.value.detail == {"phase": "fit", "end_index": e.train_end}
+
+
+def test_integer_input_is_value_error(rng):
+    X = np.arange(200).reshape(100, 2)
+    with pytest.raises(ValueError, match="floating"):
+        assert_causal(lambda X: X, X, t0=50, rng=rng)
+    with pytest.raises(ValueError, match="floating"):
+        assert_fit_ignores_future(lambda X: "digest", X, end_index=50, rng=rng)
+
+
+def test_object_output_is_value_error(rng, x100):
+    with pytest.raises(ValueError, match="dtype"):
+        assert_causal(lambda X: X.astype(object), x100, t0=50, rng=rng)
+
+
+def test_output_without_columns_is_value_error(rng, x100):
+    with pytest.raises(ValueError, match="column"):
+        assert_causal(lambda X: X[:, :0], x100, t0=50, rng=rng)
