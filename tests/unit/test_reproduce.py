@@ -1,0 +1,355 @@
+from __future__ import annotations
+
+import dataclasses
+import subprocess
+import sys
+import weakref
+from dataclasses import dataclass, field
+from pathlib import Path
+from types import MappingProxyType
+
+import numpy as np
+import pytest
+
+from tests.conftest import make_entity
+from tsguard.data.labels import LabelAudit, Phase
+from tsguard.data.smd import ENTITIES, SMD_COMMIT, EntityData
+from tsguard.eval.protocols import PROTOCOLS
+from tsguard.experiment import reproduce as reproduce_module
+from tsguard.experiment.ablation import run_ablation
+from tsguard.experiment.reproduce import (
+    FULL,
+    PROFILES,
+    SMOKE,
+    Profile,
+    best_model,
+    git_revision,
+    label_reads_at_selection,
+    reproduce,
+    require_experiment_extra,
+)
+from tsguard.experiment.runner import EntityRunner, RunConfig, Selection
+from tsguard.experiment.tracking import MemoryTracker
+from tsguard.experiment.tuning import FINAL_EXPERIMENT, TUNING_EXPERIMENT
+from tsguard.models import MODEL_NAMES
+from tsguard.models.space import DEFAULT_PARAMS
+from tsguard.repro.report import Metrics, read_metrics
+
+N_TRAIN = 3000
+N_TEST = 2000
+SEGMENTS_PER_ENTITY = 2
+TINY = Profile(
+    "tiny",
+    ("synthetic-0", "synthetic-1"),
+    ("synthetic-0",),
+    1,
+    (0,),
+    RunConfig(ae_epochs=1, threads=1),
+)
+
+
+def load_synthetic(name: str, audit: LabelAudit) -> EntityData:
+    index = int(name.rsplit("-", 1)[1])
+    return make_entity(n_train=N_TRAIN, n_test=N_TEST, seed=index, name=name, audit=audit)
+
+
+@dataclass
+class TinyRun:
+    metrics: Metrics
+    tracker: MemoryTracker
+    out_dir: Path
+    lines: list[str]
+    # for each load, whether every runner built before it was already freed
+    runners_freed_at_load: list[bool] = field(default_factory=list)
+    ablation_calls: list[dict[str, object]] = field(default_factory=list)
+
+
+@pytest.fixture(scope="module")
+def tiny_run(tmp_path_factory: pytest.TempPathFactory) -> TinyRun:
+    """Run the whole pipeline once on two synthetic entities; the slow tests share it."""
+    out_dir = tmp_path_factory.mktemp("tiny")
+    tracker = MemoryTracker()
+    lines: list[str] = []
+    refs: list[weakref.ReferenceType[EntityRunner]] = []
+    freed: list[bool] = []
+    ablation_calls: list[dict[str, object]] = []
+
+    class SpyRunner(EntityRunner):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            refs.append(weakref.ref(self))
+
+    def loader(name: str, audit: LabelAudit) -> EntityData:
+        # No gc.collect() here: reproduce itself must have released the earlier runners.
+        freed.append(all(ref() is None for ref in refs))
+        return load_synthetic(name, audit)
+
+    def spy_ablation(entities, **kwargs):
+        ablation_calls.append({"entities": tuple(entities), **kwargs})
+        return run_ablation(entities, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(reproduce_module, "EntityRunner", SpyRunner)
+        patch.setattr(reproduce_module, "run_ablation", spy_ablation)
+        metrics = reproduce(
+            TINY, loader=loader, tracker=tracker, out_dir=out_dir, progress=lines.append
+        )
+    return TinyRun(metrics, tracker, out_dir, lines, freed, ablation_calls)
+
+
+@pytest.mark.slow
+def test_tiny_reproduce_writes_valid_metrics(tiny_run):
+    m = tiny_run.metrics
+    assert read_metrics(tiny_run.out_dir / "metrics.json") == m
+    assert set(m.models) == set(MODEL_NAMES)
+    assert all(set(s.macro) == set(PROTOCOLS) for s in m.models.values())
+    assert m.headline.label_reads_at_selection == 0
+    assert m.headline.model in MODEL_NAMES
+    assert set(m.ablation) == {"zscore", "iforest"}
+    assert m.feature_specs == 63
+
+
+@pytest.mark.slow
+def test_tiny_reproduce_describes_the_run(tiny_run):
+    m = tiny_run.metrics
+    assert (m.profile, m.seed, m.schema_version) == ("tiny", 0, 1)
+    assert m.dataset.source_commit == SMD_COMMIT
+    assert (m.dataset.entities, m.dataset.channels) == (2, 38)
+    assert (m.dataset.train_steps, m.dataset.test_steps) == (2 * N_TRAIN, 2 * N_TEST)
+    assert m.dataset.anomaly_segments == 2 * SEGMENTS_PER_ENTITY
+    assert m.protocol == {"chunk": 60, "cooldown": 60, "k_percent": 20}
+    assert m.tuning.entities == ["synthetic-0"]
+    assert m.tuning.n_trials == 1
+    assert set(m.tuning.best) == set(MODEL_NAMES)
+    assert m.ablation["zscore"].seeds == [0]
+    for name, summary in m.models.items():
+        # one trial is the default configuration, so the tuned params are the defaults
+        assert summary.params == dict(DEFAULT_PARAMS[name])
+        assert [e.entity for e in summary.per_entity] == ["synthetic-0", "synthetic-1"]
+        assert set(summary.sensitivity_macro) == {
+            f"L{chunk}_C{cooldown}" for chunk in (30, 60, 120) for cooldown in (0, 60)
+        }
+    keys = set(m.environment)
+    assert {"platform", "python", "numpy", "pandas", "scikit-learn", "torch"} <= keys
+    assert {"optuna", "mlflow", "torch_threads", "git_sha", "generated_at"} <= keys
+    assert m.environment["torch_threads"] == "1"
+    assert m.environment["generated_at"].endswith("Z")
+
+
+@pytest.mark.slow
+def test_macro_scores_are_the_means_over_entities(tiny_run):
+    for summary in tiny_run.metrics.models.values():
+        for protocol in PROTOCOLS:
+            per_entity = [e.protocols[protocol].auc_pr for e in summary.per_entity]
+            assert summary.macro[protocol].auc_pr == pytest.approx(np.mean(per_entity), abs=1e-12)
+        objectives = [e.validation_objective for e in summary.per_entity]
+        assert summary.validation_objective == pytest.approx(np.mean(objectives), abs=1e-12)
+
+
+@pytest.mark.slow
+def test_tracker_gets_trial_and_final_runs(tiny_run):
+    runs = tiny_run.tracker.runs
+    assert len(runs) == 4 * 1 + 4 * 2
+    trials = [r for r in runs if r["experiment"] == TUNING_EXPERIMENT]
+    finals = [r for r in runs if r["experiment"] == FINAL_EXPERIMENT]
+    assert (len(trials), len(finals)) == (4, 8)
+    assert sorted(str(r["run_name"]) for r in finals) == sorted(
+        f"{model}-synthetic-{i}" for model in MODEL_NAMES for i in (0, 1)
+    )
+    for run in finals:
+        tags = dict(run["tags"])
+        assert tags == {"kind": "final", "model": str(run["run_name"]).split("-synthetic")[0]}
+        assert set(run["metrics"]) == {"objective"}
+        assert run["params"] == tiny_run.metrics.models[tags["model"]].params
+
+
+@pytest.mark.slow
+def test_headline_is_the_best_validation_objective(tiny_run):
+    m = tiny_run.metrics
+    objective = {name: s.validation_objective for name, s in m.models.items()}
+    best = max(objective.values())
+    winners = [name for name in MODEL_NAMES if objective[name] == best]
+    assert m.headline.model == winners[0]  # a tie goes to the earlier model in MODEL_NAMES
+    assert m.headline.protocol == "event_level"
+    assert m.headline.selected_by == "validation_objective"
+    assert m.headline.auc_pr == m.models[m.headline.model].macro["event_level"].auc_pr
+    low, high = m.headline.ci95
+    scores = [e.protocols["event_level"].auc_pr for e in m.models[m.headline.model].per_entity]
+    assert low <= np.mean(scores) <= high
+
+
+@pytest.mark.slow
+def test_each_runner_is_freed_before_the_next_entity_is_loaded(tiny_run):
+    # loads: tuning synthetic-0, selection synthetic-0 and synthetic-1, ablation 0 and 1
+    assert tiny_run.runners_freed_at_load == [True] * 5
+
+
+@pytest.mark.slow
+def test_ablation_gets_the_tuned_feature_params_and_skips_the_causal_check(tiny_run):
+    (call,) = tiny_run.ablation_calls
+    assert call["entities"] == TINY.entities
+    assert call["seeds"] == TINY.ablation_seeds
+    assert call["params"] == {name: dict(DEFAULT_PARAMS[name]) for name in ("zscore", "iforest")}
+    config = call["config"]
+    assert config == dataclasses.replace(TINY.run, causal_check=False)
+    assert TINY.run.causal_check  # the selection phase keeps the check on
+
+
+@pytest.mark.slow
+def test_progress_has_one_line_per_phase_entity_and_model(tiny_run):
+    lines = tiny_run.lines
+    assert sum(line.startswith("tune ") for line in lines) == len(MODEL_NAMES)
+    for phase in ("select", "evaluate"):
+        for entity in ("synthetic-0", "synthetic-1"):
+            for model in MODEL_NAMES:
+                assert sum(line.startswith(f"{phase} {entity} {model}:") for line in lines) == 1
+    ablation_lines = [line for line in lines if " seed=0 " in line]
+    assert len(ablation_lines) == 2 * 1 * 2  # entities x seeds x feature models
+
+
+def test_profiles_are_the_documented_ones():
+    assert isinstance(PROFILES, MappingProxyType)
+    assert dict(PROFILES) == {"full": FULL, "smoke": SMOKE}
+    assert (
+        Profile(
+            "full",
+            ENTITIES,
+            ("machine-1-1", "machine-2-1", "machine-3-1"),
+            8,
+            (0, 1, 2, 3, 4),
+            RunConfig(),
+        )
+        == FULL
+    )
+    assert (
+        Profile(
+            "smoke",
+            ("machine-1-1", "machine-2-1"),
+            ("machine-1-1",),
+            2,
+            (0,),
+            RunConfig(ae_epochs=1),
+        )
+        == SMOKE
+    )
+    assert len(FULL.entities) == 28
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("entities", ()),
+        ("entities", ("a", "a")),
+        ("tuning_entities", ()),
+        ("n_trials", 0),
+        ("ablation_seeds", ()),
+        ("ablation_seeds", (0, 0)),
+    ],
+)
+def test_a_profile_that_cannot_finish_is_refused_at_construction(field, value):
+    valid = Profile("ok", ("a",), ("a",), 1, (0,), RunConfig())
+    with pytest.raises(ValueError, match=field):
+        dataclasses.replace(valid, **{field: value})
+
+
+def test_optuna_is_imported_before_any_runner_exists(monkeypatch, tmp_path):
+    """Optuna's first import keeps a traceback alive for the whole process.
+
+    The traceback pins the frame that triggered the import. Imported lazily inside ``tune``,
+    that frame holds the tuning runners, and their 2 to 3 GB of cached features each would
+    survive every later phase. A test of the memory itself passes whenever another test module
+    has already imported Optuna, so this pins the order instead.
+    """
+    events: list[str] = []
+
+    class RunnerBuiltError(Exception):
+        pass
+
+    def stub_runner(*args, **kwargs):
+        events.append("runner")
+        raise RunnerBuiltError
+
+    monkeypatch.setattr(
+        reproduce_module, "require_experiment_extra", lambda: events.append("import")
+    )
+    monkeypatch.setattr(reproduce_module, "EntityRunner", stub_runner)
+    with pytest.raises(RunnerBuiltError):
+        reproduce(TINY, loader=load_synthetic, tracker=MemoryTracker(), out_dir=tmp_path)
+    assert events == ["import", "runner"]
+
+
+def test_a_missing_experiment_extra_is_an_import_error_that_names_it(monkeypatch):
+    monkeypatch.setitem(sys.modules, "optuna", None)
+    with pytest.raises(ImportError, match=r"experiment"):
+        require_experiment_extra()
+
+
+def test_best_model_is_the_highest_validation_objective():
+    objective = {"zscore": 0.2, "iforest": 0.3, "cnn_ae": 0.9, "lstm_ae": 0.5}
+    assert best_model(objective) == "cnn_ae"
+
+
+def test_a_tie_for_the_best_model_goes_to_the_earlier_registry_name():
+    tied = {"lstm_ae": 0.7, "cnn_ae": 0.7, "iforest": 0.1, "zscore": 0.2}  # not in registry order
+    assert best_model(tied) == "cnn_ae"
+    assert best_model({name: 0.5 for name in reversed(MODEL_NAMES)}) == MODEL_NAMES[0]
+
+
+def test_selection_that_read_no_label_is_clean():
+    audit = LabelAudit()
+    assert label_reads_at_selection([audit, LabelAudit()], []) == 0
+
+
+def test_a_label_read_during_selection_is_a_runtime_error():
+    audit = LabelAudit()
+    data = make_entity(audit=audit)
+    with audit.phase(Phase.FINAL_EVALUATION):
+        data.labels.read("peek")
+    with pytest.raises(RuntimeError, match=r"1 test-label read"):
+        label_reads_at_selection([LabelAudit(), audit], [])
+
+
+def test_a_threshold_frozen_after_a_read_is_a_runtime_error():
+    other = LabelAudit()
+    data = make_entity(audit=other, name="synthetic-9")
+    with other.phase(Phase.FINAL_EVALUATION):
+        data.labels.read("peek")
+    late = Selection(
+        entity="synthetic-9",
+        model="zscore",
+        params={},
+        seed=0,
+        folds=(),
+        objective=0.0,
+        threshold=other.freeze_threshold(0.5, caller="test"),
+        test_scores=np.zeros(1),
+        digests={},
+    )
+    with pytest.raises(RuntimeError, match=r"synthetic-9.*zscore.*1 test-label read"):
+        label_reads_at_selection([LabelAudit()], [late])
+
+
+def git(cwd: Path, *args: str) -> str:
+    done = subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return done.stdout.strip()
+
+
+def test_git_revision_outside_a_repository_is_unknown(tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    assert git_revision(tmp_path) == "unknown"
+
+
+def test_git_revision_marks_a_dirty_tree(tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    git(tmp_path, "init", "-q")
+    git(tmp_path, "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "first")
+    sha = git(tmp_path, "rev-parse", "HEAD")
+    assert git_revision(tmp_path) == sha
+    (tmp_path / "new.txt").write_text("x")
+    assert git_revision(tmp_path) == f"{sha}+dirty"

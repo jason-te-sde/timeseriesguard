@@ -100,3 +100,58 @@ jobs:
             echo "::error::A commit message carries a Co-Authored-By trailer. Remove it before merging."
             exit 1
           fi
+
+  protocol:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      UV_PYTHON: "3.11"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.12.19"
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --all-extras --group dev --python 3.11 --locked
+      - name: Restore the SMD cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/tsguard
+          key: smd-${{ hashFiles('src/tsguard/data/smd_manifest.json') }}
+      - name: Fetch SMD (a no-op on a warm cache)
+        run: uv run tsguard data fetch
+      - name: Protocol and data tests
+        run: uv run pytest tests/protocol tests/data -m "data or not data" -v
+
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      UV_PYTHON: "3.11"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.12.19"
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --all-extras --group dev --python 3.11 --locked
+      - name: Restore the SMD cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/tsguard
+          key: smd-${{ hashFiles('src/tsguard/data/smd_manifest.json') }}
+      - name: Fetch SMD (a no-op on a warm cache)
+        run: uv run tsguard data fetch
+      - name: Reproduce the smoke profile
+        run: uv run tsguard reproduce --profile smoke --out artifacts/smoke --tracking-uri sqlite:///artifacts/mlruns.db
+      - name: Slow tests
+        run: uv run pytest -m slow -v
+      - name: Keep the smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: smoke-artifacts
+          path: artifacts/
+          if-no-files-found: warn

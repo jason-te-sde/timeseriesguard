@@ -1,5 +1,269 @@
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from tests.unit.test_report_and_claims import README_TEXT, tiny_metrics, write_runs_csv
+from tsguard import cli
 from tsguard.cli import main
+from tsguard.data.labels import LabelAudit
+from tsguard.errors import ChecksumError, FetchError
+from tsguard.experiment.reproduce import SMOKE
+from tsguard.experiment.tuning import FINAL_EXPERIMENT, TUNING_EXPERIMENT
+from tsguard.repro.report import write_metrics
+
+# MLflow's SQLAlchemy store triggers a deprecation warning inside SQLAlchemy on first use.
+pytestmark = pytest.mark.filterwarnings("ignore:The ``noload`` loader strategy")
+
+STAMP = re.compile(r"^\[\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ \+\d+\.\ds\] (.*)$")
 
 
-def test_main_returns_the_process_exit_code_zero():
-    assert main() == 0
+@pytest.fixture
+def repo(tmp_path: Path) -> Path:
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    write_metrics(reports / "metrics.json", tiny_metrics())
+    write_runs_csv(reports / "mlflow_runs.csv", 32)
+    (tmp_path / "README.md").write_text(README_TEXT)
+    return tmp_path
+
+
+def test_claims_check_exit_codes(repo, capsys):
+    root = ["--root", str(repo)]
+    assert main(["claims", "--write", *root]) == 0
+    assert main(["claims", "--check", *root]) == 0
+    assert capsys.readouterr().err == ""
+    path = repo / "reports" / "claims.json"
+    data = json.loads(path.read_text())
+    data["headline_auc_pr"] = 0.80
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    capsys.readouterr()
+    assert main(["claims", "--check", *root]) == 1
+    assert (
+        "claims.json: headline_auc_pr is 0.80, metrics.json gives 0.82" in capsys.readouterr().out
+    )
+
+
+def test_claims_with_broken_readme_markers_exit_1_with_the_message(repo, capsys):
+    (repo / "README.md").write_text("# Demo\n\nno markers here\n")
+    for flag in ("--check", "--write"):
+        assert main(["claims", flag, "--root", str(repo)]) == 1
+        err = capsys.readouterr().err
+        assert err.startswith("tsguard: error: ")
+        assert "claims:begin" in err
+        assert "Traceback" not in err
+
+
+def test_claims_write_without_reports_exits_1(tmp_path, capsys):
+    assert main(["claims", "--write", "--root", str(tmp_path)]) == 1
+    assert "metrics.json" in capsys.readouterr().err
+
+
+def test_claims_needs_exactly_one_mode():
+    for argv in (["claims"], ["claims", "--check", "--write"]):
+        with pytest.raises(SystemExit) as e:
+            main(argv)
+        assert e.value.code == 2
+
+
+def test_unknown_entity_exit_code(capsys):
+    assert main(["data", "verify", "--entities", "machine-9-9"]) == 1
+    err = capsys.readouterr().err
+    assert "machine-9-9" in err
+    assert "machine-1-1" in err  # the message lists the valid names
+
+
+def test_usage_error_is_2():
+    with pytest.raises(SystemExit) as e:
+        main(["nope"])
+    assert e.value.code == 2
+
+
+def test_no_subcommand_is_a_usage_error():
+    with pytest.raises(SystemExit) as e:
+        main([])
+    assert e.value.code == 2
+
+
+def test_unknown_profile_is_a_usage_error():
+    with pytest.raises(SystemExit) as e:
+        main(["reproduce", "--profile", "huge"])
+    assert e.value.code == 2
+
+
+def test_data_fetch_passes_entities_and_destination(monkeypatch, tmp_path, capsys):
+    seen: dict[str, Any] = {}
+
+    def fake_fetch(entities, *, dest):
+        seen.update(entities=tuple(entities), dest=dest)
+        return [tmp_path / "a", tmp_path / "b"]
+
+    monkeypatch.setattr(cli, "fetch", fake_fetch)
+    argv = ["data", "fetch", "--entities", "machine-1-1", "machine-1-2", "--dest", str(tmp_path)]
+    assert main(argv) == 0
+    assert seen == {"entities": ("machine-1-1", "machine-1-2"), "dest": tmp_path}
+    assert "2 files" in capsys.readouterr().out
+
+
+def test_data_fetch_defaults_to_every_entity(monkeypatch):
+    seen: dict[str, Any] = {}
+
+    def fake_fetch(entities, *, dest):
+        seen.update(entities=tuple(entities), dest=dest)
+        return []
+
+    monkeypatch.setattr(cli, "fetch", fake_fetch)
+    assert main(["data", "fetch"]) == 0
+    assert len(seen["entities"]) == 28
+    assert seen["dest"] is None
+
+
+@pytest.mark.parametrize(
+    "error", [FetchError("train/machine-1-1.txt: offline"), ChecksumError("bad")]
+)
+def test_data_errors_are_a_message_and_exit_1(monkeypatch, capsys, error):
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(cli, "fetch", fail)
+    monkeypatch.setattr(cli, "verify", fail)
+    for command in ("fetch", "verify"):
+        assert main(["data", command]) == 1
+        captured = capsys.readouterr()
+        assert captured.err == f"tsguard: error: {error}\n"
+        assert captured.out == ""
+
+
+def test_data_verify_reports_what_it_checked(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "verify", lambda entities, *, dest: None)
+    assert main(["data", "verify", "--entities", "machine-1-1"]) == 0
+    assert "machine-1-1" in capsys.readouterr().out
+
+
+def test_reproduce_wires_profile_and_export(monkeypatch, tmp_path):
+    seen: dict[str, Any] = {}
+
+    def fake_reproduce(profile, *, loader, tracker, out_dir, progress):
+        seen.update(profile=profile, out_dir=out_dir, loader=loader, tracker=tracker)
+
+    def fake_export(uri, path, *, experiments):
+        seen.update(uri=uri, csv=path, experiments=list(experiments))
+        return 16
+
+    monkeypatch.setattr(cli, "reproduce", fake_reproduce)
+    monkeypatch.setattr(cli, "export_runs", fake_export)
+    assert main(["reproduce", "--profile", "smoke", "--out", str(tmp_path)]) == 0
+    assert seen["profile"] == SMOKE
+    assert seen["out_dir"] == tmp_path
+    assert seen["csv"] == tmp_path / "mlflow_runs.csv"
+    assert seen["experiments"] == [TUNING_EXPERIMENT, FINAL_EXPERIMENT]
+    assert seen["uri"] == f"sqlite:///{tmp_path / 'mlruns.db'}"  # the default lives in --out
+    assert type(seen["tracker"]).__name__ == "MlflowTracker"
+
+
+def test_reproduce_entities_override_only_the_evaluated_entities(monkeypatch, tmp_path):
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "reproduce", lambda profile, **kw: seen.update(profile=profile))
+    monkeypatch.setattr(cli, "export_runs", lambda uri, path, *, experiments: 0)
+    argv = ["reproduce", "--profile", "smoke", "--out", str(tmp_path), "--entities", "machine-1-2"]
+    assert main(argv) == 0
+    assert seen["profile"].entities == ("machine-1-2",)
+    assert seen["profile"].tuning_entities == SMOKE.tuning_entities
+    assert seen["profile"].n_trials == SMOKE.n_trials
+
+
+def test_reproduce_rejects_an_unknown_entity_before_any_work(monkeypatch, tmp_path, capsys):
+    def never(*args, **kwargs):
+        raise AssertionError("reproduce must not start")
+
+    monkeypatch.setattr(cli, "reproduce", never)
+    argv = ["reproduce", "--profile", "smoke", "--out", str(tmp_path), "--entities", "nope"]
+    assert main(argv) == 1
+    assert "nope" in capsys.readouterr().err
+
+
+def test_reproduce_rejects_a_repeated_entity(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(cli, "reproduce", lambda *a, **k: None)
+    names = ["machine-1-1", "machine-1-1"]
+    argv = ["reproduce", "--profile", "smoke", "--out", str(tmp_path), "--entities", *names]
+    assert main(argv) == 1
+    assert "machine-1-1" in capsys.readouterr().err
+
+
+def test_reproduce_refuses_an_existing_tracking_store(monkeypatch, tmp_path, capsys):
+    def never(*args, **kwargs):
+        raise AssertionError("reproduce must not start")
+
+    monkeypatch.setattr(cli, "reproduce", never)
+    store = tmp_path / "mlruns.db"
+    store.write_bytes(b"")
+    assert main(["reproduce", "--profile", "smoke", "--out", str(tmp_path)]) == 1
+    err = capsys.readouterr().err
+    assert str(store) in err
+    assert "delete it or pass another --tracking-uri" in err
+    assert store.read_bytes() == b""  # the refusal touches nothing
+
+
+def test_reproduce_creates_the_directory_of_a_new_tracking_store(monkeypatch, tmp_path):
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "reproduce", lambda profile, **kw: None)
+    monkeypatch.setattr(
+        cli, "export_runs", lambda uri, path, *, experiments: seen.update(uri=uri) or 0
+    )
+    uri = f"sqlite:///{tmp_path / 'deep' / 'er' / 'runs.db'}"
+    argv = [
+        "reproduce",
+        "--profile",
+        "smoke",
+        "--out",
+        str(tmp_path / "out"),
+        "--tracking-uri",
+        uri,
+    ]
+    assert main(argv) == 0
+    assert seen["uri"] == uri
+    assert (tmp_path / "deep" / "er").is_dir()
+
+
+def test_reproduce_progress_lines_carry_a_utc_stamp_and_elapsed_seconds(
+    monkeypatch, tmp_path, capsys
+):
+    def fake_reproduce(profile, *, loader, tracker, out_dir, progress):
+        progress("tune zscore: best objective 0.5")
+        progress("select machine-1-1 zscore: validation objective 0.4")
+
+    monkeypatch.setattr(cli, "reproduce", fake_reproduce)
+    monkeypatch.setattr(cli, "export_runs", lambda uri, path, *, experiments: 0)
+    assert main(["reproduce", "--profile", "smoke", "--out", str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    stamped = [line for line in captured.err.splitlines() if STAMP.match(line)]
+    assert [STAMP.match(line).group(1) for line in stamped] == [  # type: ignore[union-attr]
+        "tune zscore: best objective 0.5",
+        "select machine-1-1 zscore: validation objective 0.4",
+    ]
+    assert "tune zscore" not in captured.out  # progress is on stderr only
+
+
+def test_reproduce_loads_entities_from_the_data_directory(monkeypatch, tmp_path):
+    seen: dict[str, Any] = {}
+    loaded: list[tuple[str, LabelAudit]] = []
+
+    def fake_reproduce(profile, *, loader, tracker, out_dir, progress):
+        seen["loader"] = loader
+
+    def fake_load_entity(name, *, audit, dest=None):
+        loaded.append((name, audit))
+        assert dest is None  # TSGUARD_DATA_DIR and the default directory decide
+        return "entity"
+
+    monkeypatch.setattr(cli, "reproduce", fake_reproduce)
+    monkeypatch.setattr(cli, "export_runs", lambda uri, path, *, experiments: 0)
+    monkeypatch.setattr(cli, "load_entity", fake_load_entity)
+    assert main(["reproduce", "--profile", "smoke", "--out", str(tmp_path)]) == 0
+    audit = LabelAudit()
+    assert seen["loader"]("machine-1-1", audit) == "entity"
+    assert loaded == [("machine-1-1", audit)]
