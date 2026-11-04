@@ -15,13 +15,17 @@ import math
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import InitVar, dataclass
-from typing import Final
+from typing import Final, NoReturn
 
 import numpy as np
 
 from tsguard.errors import LabelAccessError
 
 _FREEZE_TOKEN: Final = object()
+_AUDIT_COPY_MESSAGE: Final = (
+    "a LabelAudit cannot be copied or pickled; a copy would stop following the phase of "
+    "the original and would log reads where nobody looks"
+)
 
 
 class Phase(enum.Enum):
@@ -41,17 +45,20 @@ class LabelAudit:
 
     A new audit starts in `Phase.SELECTION`. One audit is shared by all the
     `AuditedLabels` of a run, so a single `phase` block switches every entity at once.
+
+    An audit cannot be copied or pickled: a clone would keep the phase it had when it was
+    cloned and would log into a record nobody reads.
     """
 
     def __init__(self) -> None:
         """Create an audit in the selection phase with an empty access log."""
-        self._phase = Phase.SELECTION
+        self._open: list[Phase] = []
         self._accesses: list[tuple[str, str, Phase]] = []
 
     @property
     def current(self) -> Phase:
         """The phase the experiment is in right now."""
-        return self._phase
+        return self._open[-1] if self._open else Phase.SELECTION
 
     @property
     def accesses(self) -> tuple[tuple[str, str, Phase], ...]:
@@ -67,18 +74,36 @@ class LabelAudit:
     def phase(self, phase: Phase) -> Iterator[None]:
         """Run a block in ``phase`` and restore the previous phase on exit, even on error.
 
+        Blocks must nest: each one has to be left before the block it was opened in. A block
+        left while a block opened inside it is still open puts the audit back to the phase
+        the leaving block replaced, so the audit cannot stay in a stale phase, and then
+        raises.
+
         Args:
-            phase: The phase to enter.
+            phase: The phase to enter, or the string value of one (``"final_evaluation"``).
 
         Yields:
             Nothing; the phase is active for the duration of the ``with`` block.
+
+        Raises:
+            ValueError: ``phase`` is neither a `Phase` nor the value of one.
+            RuntimeError: On exit, a block opened inside this one is still open, or this
+                block was already closed by an outer one.
         """
-        previous = self._phase
-        self._phase = phase
+        entered = Phase(phase)
+        depth = len(self._open)
+        self._open.append(entered)
         try:
             yield
         finally:
-            self._phase = previous
+            active = self.current
+            out_of_order = len(self._open) != depth + 1
+            del self._open[depth:]
+            if out_of_order:
+                raise RuntimeError(
+                    f"phase blocks exited out of order: leaving '{entered.value}' while "
+                    f"'{active.value}' is the active phase; phase blocks must nest"
+                )
 
     def freeze_threshold(self, value: float, *, caller: str) -> FrozenThreshold:
         """Freeze a decision threshold chosen before any test label was read.
@@ -92,21 +117,37 @@ class LabelAudit:
 
         Raises:
             LabelAccessError: The current phase is `Phase.FINAL_EVALUATION`.
+            TypeError: ``value`` is a bool or not a real number.
             ValueError: ``value`` is NaN or infinite.
         """
-        if self._phase is Phase.FINAL_EVALUATION:
+        phase = self.current
+        if phase is Phase.FINAL_EVALUATION:
             raise LabelAccessError(
-                f"threshold frozen by '{caller}' during '{self._phase.value}'; "
+                f"threshold frozen by '{caller}' during '{phase.value}'; "
                 "reported thresholds must be chosen before any test label is read",
-                detail={"caller": caller, "phase": self._phase.value},
+                detail={"caller": caller, "phase": phase.value},
             )
+        if isinstance(value, bool | np.bool_):
+            raise TypeError(f"threshold frozen by '{caller}' must be a number, not bool")
         if not math.isfinite(value):
             raise ValueError(f"threshold frozen by '{caller}' must be finite, got {value!r}")
-        return FrozenThreshold(value, _token=_FREEZE_TOKEN)
+        return FrozenThreshold(float(value), reads_before=self.reads, _token=_FREEZE_TOKEN)
 
-    def _log_read(self, entity: str, caller: str) -> None:
-        """Record a successful read; only `AuditedLabels.read` calls this."""
-        self._accesses.append((entity, caller, self._phase))
+    def _log_read(self, entity: str, caller: str, phase: Phase) -> None:
+        """Record a successful read in the phase `AuditedLabels.read` checked."""
+        self._accesses.append((entity, caller, phase))
+
+    def __reduce__(self) -> NoReturn:
+        """Refuse pickling."""
+        raise TypeError(_AUDIT_COPY_MESSAGE)
+
+    def __copy__(self) -> NoReturn:
+        """Refuse shallow copying."""
+        raise TypeError(_AUDIT_COPY_MESSAGE)
+
+    def __deepcopy__(self, memo: dict[int, object]) -> NoReturn:
+        """Refuse deep copying."""
+        raise TypeError(_AUDIT_COPY_MESSAGE)
 
 
 @dataclass(frozen=True)
@@ -118,9 +159,12 @@ class FrozenThreshold:
 
     Attributes:
         value: The threshold.
+        reads_before: Number of test-label reads the audit had logged when the threshold
+            was frozen. A threshold chosen during selection has 0.
     """
 
     value: float
+    reads_before: int
     _token: InitVar[object]
 
     def __post_init__(self, _token: object) -> None:
@@ -143,17 +187,28 @@ class AuditedLabels:
     `read`: there is no ``__array__`` and no public attribute that holds them, and ``repr``
     shows only the entity and the length. The `audit` property gives access to the shared
     phase and read log, never to values.
+
+    The labels cannot be copied or pickled: a clone would carry the values, or a stale
+    audit, out of the guard.
     """
 
     def __init__(self, values: np.ndarray, *, audit: LabelAudit, entity: str) -> None:
         """Wrap ``values``.
 
         Args:
-            values: Labels, one per row; copied as ``int8``.
+            values: Labels, one per row, each 0 or 1; copied as ``int8``.
             audit: The audit that says when reading is allowed and logs each read.
             entity: Name of the entity the labels belong to, quoted in errors.
+
+        Raises:
+            ValueError: ``values`` is not one-dimensional, or holds anything but 0 and 1.
         """
-        self._values = np.array(values, dtype=np.int8, copy=True)
+        raw = np.asarray(values)
+        if raw.ndim != 1:
+            raise ValueError(f"{entity}: test labels must be 1-D, got shape {raw.shape}")
+        if not np.isin(raw, (0, 1)).all():
+            raise ValueError(f"{entity}: test labels must each be 0 or 1")
+        self._values = np.array(raw, dtype=np.int8, copy=True)
         self._audit = audit
         self._entity = entity
 
@@ -189,7 +244,25 @@ class AuditedLabels:
                 f"labels are readable only during '{Phase.FINAL_EVALUATION.value}'",
                 detail={"entity": self._entity, "caller": caller, "phase": phase.value},
             )
-        self._audit._log_read(self._entity, caller)
+        self._audit._log_read(self._entity, caller, phase)
         out = self._values.copy()
         out.flags.writeable = False
         return out
+
+    def __reduce__(self) -> NoReturn:
+        """Refuse pickling, which would write the values out."""
+        raise TypeError(self._copy_message())
+
+    def __copy__(self) -> NoReturn:
+        """Refuse shallow copying."""
+        raise TypeError(self._copy_message())
+
+    def __deepcopy__(self, memo: dict[int, object]) -> NoReturn:
+        """Refuse deep copying."""
+        raise TypeError(self._copy_message())
+
+    def _copy_message(self) -> str:
+        return (
+            f"{self._entity}: audited labels cannot be copied or pickled; "
+            "a copy would carry the values, or a stale audit, past the guard"
+        )
