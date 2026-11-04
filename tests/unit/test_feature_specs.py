@@ -227,6 +227,39 @@ def test_flat_window_skew_and_kurt_are_zero(name, constant):
     assert (out[warmup:] == 0.0).all()
 
 
+# With deviations of about 1e-100 the second moment is 1e-200 and its square underflows to 0, so
+# the ratio is 0/0. A window is flat when the denominator itself is zero. SMD never gets near
+# this (its smallest nonzero step is 1e-6); the service accepts any magnitude up to 1e6 in
+# either direction, so the registry has to be finite everywhere in between.
+DENOMINATOR_UNDERFLOWS = {("roll_kurt", -100), ("roll_kurt", -160), ("roll_skew", -160)}
+SKEW_AND_KURT = [f"roll_{k}_{w}" for k in ("skew", "kurt") for w in (5, 15, 60)]
+
+
+@pytest.mark.parametrize("exponent", [-80, -100, -160])
+@pytest.mark.parametrize("name", SKEW_AND_KURT)
+def test_tiny_magnitude_window_skew_and_kurt_are_finite(name, exponent, rng):
+    x = 10.0**exponent * rng.standard_normal((100, 2))
+    out = value(name, x)[spec_named(name).lookback - 1 :]
+    assert np.isfinite(out).all(), (
+        f"{name} at magnitude 1e{exponent} has {(~np.isfinite(out)).sum()} non-finite values"
+    )
+    if (name.rsplit("_", 1)[0], exponent) in DENOMINATOR_UNDERFLOWS:
+        assert (out == 0.0).all(), (
+            f"{name} at 1e{exponent}: a window whose denominator is 0 is flat"
+        )
+
+
+@pytest.mark.parametrize("exponent", [-20, -60])
+@pytest.mark.parametrize("name", SKEW_AND_KURT)
+def test_small_but_representable_windows_keep_their_moments(name, exponent, rng):
+    unit = rng.standard_normal((100, 2))
+    start = spec_named(name).lookback - 1
+    scaled = value(name, 10.0**exponent * unit)[start:]
+    reference = value(name, unit)[start:]
+    assert (reference != 0.0).any()
+    np.testing.assert_allclose(scaled, reference, rtol=1e-9, atol=1e-12)
+
+
 @pytest.mark.parametrize("constant", [0.3, 0.1, 0.7, 1.0 / 3.0])
 def test_flat_window_is_exact_for_the_other_statistics(constant):
     x = np.full((100, 2), constant)

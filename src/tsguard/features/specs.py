@@ -138,16 +138,18 @@ def _skew(windows: np.ndarray) -> np.ndarray:
     dev = _deviations(windows)
     d2 = dev * dev
     m2, m3 = d2.mean(axis=-1), (d2 * dev).mean(axis=-1)
-    spread = m2 > 0.0  # a flat window has m2 == 0 and skew 0
-    return np.where(spread, m3 / np.where(spread, m2, 1.0) ** 1.5, 0.0)
+    denominator = m2**1.5
+    flat = denominator == 0.0  # m2 == 0, or so small that m2 ** 1.5 underflows: skew 0 either way
+    return np.where(flat, 0.0, m3 / np.where(flat, 1.0, denominator))
 
 
 def _kurt(windows: np.ndarray) -> np.ndarray:
     dev = _deviations(windows)
     d2 = dev * dev
     m2, m4 = d2.mean(axis=-1), (d2 * d2).mean(axis=-1)
-    spread = m2 > 0.0  # a flat window has m2 == 0 and excess kurtosis 0
-    return np.where(spread, m4 / np.where(spread, m2, 1.0) ** 2 - 3.0, 0.0)
+    denominator = m2 * m2
+    flat = denominator == 0.0  # m2 == 0, or so small that m2 * m2 underflows: kurtosis 0 either way
+    return np.where(flat, 0.0, m4 / np.where(flat, 1.0, denominator) - 3.0)
 
 
 def _range(windows: np.ndarray) -> np.ndarray:
