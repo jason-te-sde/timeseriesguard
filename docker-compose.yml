@@ -1,0 +1,31 @@
+# One service: the scoring API for the bundle in artifacts/bundle/.
+#
+#   make bundle container-up latency
+#
+# `make bundle` writes artifacts/bundle/bundle.joblib and its bundle.joblib.sha256; both must be
+# there, and readable by uid 10001 (the unprivileged user of the image), before the service starts.
+services:
+  tsguard:
+    build: .
+    ports:
+      # Loopback only: the service has no authentication.
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./artifacts/bundle:/models:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      # The image's probe, repeated so that it does not depend on how the engine merges a partial
+      # healthcheck with the image's; only the timing differs. The bundle loads before the server
+      # listens, so a start takes a while: up to 60 tries, 2 s apart.
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)",
+        ]
+      interval: 2s
+      timeout: 5s
+      retries: 60

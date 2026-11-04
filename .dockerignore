@@ -1,0 +1,14 @@
+# Everything is excluded unless it is listed: the build context never carries the virtualenv, the
+# SMD data, a bundle, the reports or the git history.
+*
+
+!pyproject.toml
+!uv.lock
+!.python-version
+!README.md
+!LICENSE
+!src
+
+# Bytecode of the host's Python is of no use in the image.
+**/__pycache__
+**/*.pyc
