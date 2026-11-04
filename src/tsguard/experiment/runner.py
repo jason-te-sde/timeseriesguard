@@ -6,9 +6,12 @@ freezes a decision threshold from the last fold, and scores the test rows. Along
 calls every leakage guard itself, so a leaky component handed to the runner is stopped by the
 guard that exists for it (the tests in ``tests/leakage/test_runner_wiring.py`` pin each call).
 
-`EntityRunner.evaluate` is the only place the project's normal flow reads test labels: it opens
-the final-evaluation phase, reads the labels once under the name ``evaluate[<model>]``, and
-scores the frozen selection under every protocol.
+`evaluate_selection` (and `EntityRunner.evaluate`, which wraps it) opens the final-evaluation
+phase, reads the labels once under the name ``evaluate[<model>]``, and scores the frozen
+selection under every protocol. It does not check that the selection was made before any read;
+callers that evaluate several selections (`tsguard.experiment.reproduce`,
+`tsguard.experiment.ablation`) select everything first and refuse to continue if any label was
+read before a threshold was frozen.
 
 Pipeline fits and injected validation blocks are cached on the runner, because they depend on
 the entity, the fold and the seed but not on the model: a search over several models or

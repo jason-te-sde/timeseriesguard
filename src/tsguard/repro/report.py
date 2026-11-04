@@ -15,18 +15,18 @@ import json
 import math
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Annotated, Literal, Self
+from typing import Annotated, Final, Literal, Self
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-PERCENTILES = (2.5, 97.5)
+PERCENTILES: Final = (2.5, 97.5)
 """The percentiles that bound a 95 % bootstrap interval."""
 
 FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
 """A float that validation refuses to take as NaN or infinite."""
 
-HEADLINE_AUC_TOLERANCE = 1e-9
+HEADLINE_AUC_TOLERANCE: Final = 1e-9
 """How far ``headline.auc_pr`` may sit from the model table's value before they disagree."""
 
 
