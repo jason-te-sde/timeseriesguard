@@ -68,12 +68,39 @@ def test_different_seeds_give_different_signals_but_the_same_labels():
     assert np.array_equal(labels_of(a), labels_of(b))
 
 
-def test_the_global_numpy_random_state_is_untouched():
-    np.random.seed(5)
-    expected = np.random.random()
-    np.random.seed(5)
-    make_entity(seed=9)
-    assert np.random.random() == expected
+def forbid_global_numpy_random(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Make every ``np.random.<function>`` bound to the global ``RandomState`` raise."""
+    names = [
+        name
+        for name in dir(np.random.RandomState)
+        if not name.startswith("_") and hasattr(np.random, name)
+    ]
+
+    def refuse(name: str):
+        def raiser(*args: object, **kwargs: object) -> None:
+            raise AssertionError(f"np.random.{name} touches the global random state")
+
+        return raiser
+
+    for name in names:
+        monkeypatch.setattr(np.random, name, refuse(name))
+    return names
+
+
+def test_the_global_numpy_random_functions_are_forbidden_while_the_tests_below_run(monkeypatch):
+    names = forbid_global_numpy_random(monkeypatch)
+    assert {"seed", "random", "rand", "randn", "randint", "uniform", "normal"} <= set(names)
+    with pytest.raises(AssertionError, match="global random state"):
+        np.random.random()
+    with pytest.raises(AssertionError, match="global random state"):
+        np.random.seed(0)
+
+
+def test_make_entity_never_touches_the_global_numpy_random_state(monkeypatch):
+    forbid_global_numpy_random(monkeypatch)
+    e = make_entity(seed=9)
+    assert e.train.shape == (2000, N_CHANNELS)
+    assert np.array_equal(e.train, make_entity(seed=9).train)
 
 
 def test_signal_channels_are_scaled_into_the_documented_band():
