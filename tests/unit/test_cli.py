@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +13,7 @@ from tests.unit.test_report_and_claims import README_TEXT, tiny_metrics, write_r
 from tsguard import cli
 from tsguard.cli import main
 from tsguard.data.labels import LabelAudit
-from tsguard.errors import ChecksumError, FetchError
+from tsguard.errors import ChecksumError, ContractError, FetchError
 from tsguard.experiment.reproduce import SMOKE
 from tsguard.experiment.tuning import FINAL_EXPERIMENT, TUNING_EXPERIMENT
 from tsguard.repro.report import write_metrics
@@ -302,3 +304,151 @@ def test_reproduce_loads_entities_from_the_data_directory(monkeypatch, tmp_path)
     audit = LabelAudit()
     assert seen["loader"]("machine-1-1", audit) == "entity"
     assert loaded == [("machine-1-1", audit)]
+
+
+BUNDLE_ARGV = ["bundle", "--entity", "machine-1-1", "--out", "artifacts/bundle/bundle.joblib"]
+
+
+def test_bundle_defaults_take_the_headline_and_the_committed_metrics(monkeypatch, capsys):
+    seen: dict[str, Any] = {}
+
+    def fake_bundle_command(**kwargs):
+        seen.update(kwargs)
+        return "wrote the bundle"
+
+    monkeypatch.setattr(cli, "bundle_command", fake_bundle_command)
+    assert main(BUNDLE_ARGV) == 0
+    assert seen == {
+        "entity": "machine-1-1",
+        "model": None,
+        "metrics_path": Path("reports/metrics.json"),
+        "default_params": False,
+        "out": Path("artifacts/bundle/bundle.joblib"),
+    }
+    assert capsys.readouterr().out == "wrote the bundle\n"
+
+
+def test_bundle_passes_every_flag_through(monkeypatch, tmp_path):
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "bundle_command", lambda **kwargs: seen.update(kwargs) or "ok")
+    argv = [
+        "bundle",
+        "--entity",
+        "machine-2-1",
+        "--model",
+        "cnn_ae",
+        "--metrics",
+        str(tmp_path / "m.json"),
+        "--default-params",
+        "--out",
+        str(tmp_path / "b.joblib"),
+    ]
+    assert main(argv) == 0
+    assert seen == {
+        "entity": "machine-2-1",
+        "model": "cnn_ae",
+        "metrics_path": tmp_path / "m.json",
+        "default_params": True,
+        "out": tmp_path / "b.joblib",
+    }
+
+
+def test_bundle_rejects_an_unknown_entity_before_any_work(monkeypatch, capsys):
+    def never(**kwargs):
+        raise AssertionError("nothing may be fitted for an entity that does not exist")
+
+    monkeypatch.setattr(cli, "bundle_command", never)
+    assert main(["bundle", "--entity", "machine-9-9", "--out", "b.joblib"]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("tsguard: error: ")
+    assert "machine-9-9" in err
+    assert "machine-1-1" in err  # the message lists the valid names
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["bundle", "--out", "b.joblib"],
+        ["bundle", "--entity", "machine-1-1"],
+        ["bundle", *BUNDLE_ARGV[1:], "--model", "gpt"],
+        ["serve"],
+        ["serve", "--bundle", "b.joblib", "--port", "eighty"],
+    ],
+)
+def test_bundle_and_serve_usage_errors_are_2(argv):
+    with pytest.raises(SystemExit) as e:
+        main(argv)
+    assert e.value.code == 2
+
+
+def test_serve_defaults_to_loopback_on_8000(monkeypatch):
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "serve_command", lambda **kwargs: seen.update(kwargs))
+    assert main(["serve", "--bundle", "artifacts/bundle/bundle.joblib"]) == 0
+    assert seen == {
+        "bundle": Path("artifacts/bundle/bundle.joblib"),
+        "host": "127.0.0.1",
+        "port": 8000,
+    }
+
+
+def test_serve_passes_host_and_port_through(monkeypatch, tmp_path):
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "serve_command", lambda **kwargs: seen.update(kwargs))
+    argv = ["serve", "--bundle", str(tmp_path / "b.joblib"), "--host", "0.0.0.0", "--port", "9001"]
+    assert main(argv) == 0
+    assert seen == {"bundle": tmp_path / "b.joblib", "host": "0.0.0.0", "port": 9001}
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ChecksumError("bundle.joblib: sha256 does not match its sidecar"),
+        ContractError("bundle.joblib: not a tsguard bundle"),
+        FileNotFoundError("reports/metrics.json does not exist, so there is nothing to tune from"),
+        ValueError("unknown model 'nope'; valid names: zscore, iforest"),
+    ],
+    ids=lambda error: type(error).__name__,
+)
+def test_bundle_and_serve_failures_are_a_message_and_exit_1(monkeypatch, capsys, error):
+    def fail(**kwargs):
+        raise error
+
+    monkeypatch.setattr(cli, "bundle_command", fail)
+    monkeypatch.setattr(cli, "serve_command", fail)
+    for argv in (BUNDLE_ARGV, ["serve", "--bundle", "b.joblib"]):
+        assert main(argv) == 1
+        err = capsys.readouterr().err
+        assert err == f"tsguard: error: {error}\n"
+
+
+def test_a_bug_in_a_command_keeps_its_traceback(monkeypatch):
+    def broken(**kwargs):
+        raise RuntimeError("a bug")
+
+    monkeypatch.setattr(cli, "serve_command", broken)
+    with pytest.raises(RuntimeError, match="a bug"):
+        main(["serve", "--bundle", "b.joblib"])
+
+
+def test_the_command_line_and_the_service_import_without_the_experiment_extra():
+    # The container installs the runtime dependencies only, so `tsguard serve` must start
+    # without MLflow and Optuna. A fresh interpreter, because this process already has them.
+    code = "\n".join(
+        [
+            "import sys",
+            "for name in ('mlflow', 'optuna'):",
+            "    sys.modules[name] = None",
+            "try:",
+            "    import mlflow",
+            "except ImportError:",
+            "    pass",
+            "else:",
+            "    raise SystemExit('the stub does not block mlflow')",
+            "import tsguard.cli, tsguard.serve.app, tsguard.serve.commands",
+        ]
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=300
+    )
+    assert result.returncode == 0, result.stderr

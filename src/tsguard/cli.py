@@ -1,10 +1,14 @@
 """Command-line entry point for tsguard.
 
-Three command groups: ``data`` fetches and verifies the SMD files, ``reproduce`` runs a profile
-end to end and exports its MLflow runs, and ``claims`` checks or rewrites the numbers the README
-quotes. Every failure the package raises on purpose is printed as one line on stderr with exit
-code 1; a usage error exits with 2 (argparse), and anything else is a bug and keeps its
-traceback.
+Five command groups: ``data`` fetches and verifies the SMD files, ``reproduce`` runs a profile
+end to end and exports its MLflow runs, ``claims`` checks or rewrites the numbers the README
+quotes, ``bundle`` fits one model on one machine and writes it as a checksummed file, and
+``serve`` serves such a file over HTTP. Every failure the package raises on purpose is printed as
+one line on stderr with exit code 1; a usage error exits with 2 (argparse), and anything else is
+a bug and keeps its traceback.
+
+Nothing imported here may need MLflow or Optuna when it is imported: the container installs the
+runtime dependencies only and starts ``tsguard serve``.
 """
 
 from __future__ import annotations
@@ -26,10 +30,15 @@ from tsguard.experiment.tracking import MlflowTracker, export_runs
 from tsguard.experiment.tuning import FINAL_EXPERIMENT, TUNING_EXPERIMENT
 from tsguard.models import MODEL_NAMES
 from tsguard.repro.claims import check_claims, write_claims
+from tsguard.serve.commands import bundle_command, serve_command
 
 PROG: Final = "tsguard"
 SQLITE_PREFIX: Final = "sqlite:///"
 EXIT_ERROR: Final = 1
+DEFAULT_METRICS: Final = Path("reports") / "metrics.json"
+DEFAULT_HOST: Final = "127.0.0.1"
+"""Loopback: serving beyond this machine is a choice the caller makes with ``--host``."""
+DEFAULT_PORT: Final = 8000
 
 
 class CliError(TsguardError):
@@ -92,6 +101,44 @@ def _build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--write", action="store_true", help="rewrite claims.json and the README")
     claims.add_argument("--root", type=Path, default=Path("."), help="the repository root")
     claims.set_defaults(handler=_claims)
+
+    bundle = commands.add_parser(
+        "bundle", help="fit a model on one machine's train rows and write it as a bundle"
+    )
+    bundle.add_argument("--entity", required=True, metavar="NAME", help="machine, e.g. machine-1-1")
+    bundle.add_argument(
+        "--model",
+        choices=MODEL_NAMES,
+        help="detector to fit; default the headline of --metrics, or iforest if there is none",
+    )
+    bundle.add_argument(
+        "--metrics",
+        type=Path,
+        default=DEFAULT_METRICS,
+        help=f"metrics.json that names the headline and holds the tuned parameters "
+        f"(default: {DEFAULT_METRICS})",
+    )
+    bundle.add_argument(
+        "--default-params",
+        action="store_true",
+        help="use the registry's default hyper-parameters instead of the tuned ones",
+    )
+    bundle.add_argument(
+        "--out", type=Path, required=True, help="bundle file; <out>.sha256 is written beside it"
+    )
+    bundle.set_defaults(handler=_bundle)
+
+    serve = commands.add_parser("serve", help="serve a bundle over HTTP")
+    serve.add_argument(
+        "--bundle", type=Path, required=True, help="bundle file, with its .sha256 beside it"
+    )
+    serve.add_argument(
+        "--host", default=DEFAULT_HOST, help=f"address to bind (default: {DEFAULT_HOST})"
+    )
+    serve.add_argument(
+        "--port", type=int, default=DEFAULT_PORT, help=f"port to bind (default: {DEFAULT_PORT})"
+    )
+    serve.set_defaults(handler=_serve)
     return parser
 
 
@@ -196,3 +243,29 @@ def _claims(args: argparse.Namespace) -> int:
     for message in messages:
         print(message)
     return EXIT_ERROR if messages else 0
+
+
+def _bundle(args: argparse.Namespace) -> int:
+    (entity,) = _entities([args.entity])
+    try:
+        summary = bundle_command(
+            entity=entity,
+            model=args.model,
+            metrics_path=args.metrics,
+            default_params=args.default_params,
+            out=args.out,
+        )
+    except (ValueError, OSError) as error:
+        # The failures bundle_command documents: no metrics file, an unusable one, a model the
+        # metrics do not hold, a data file that is not there.
+        raise CliError(" ".join(str(error).split())) from error
+    print(summary)
+    return 0
+
+
+def _serve(args: argparse.Namespace) -> int:
+    try:
+        serve_command(bundle=args.bundle, host=args.host, port=args.port)
+    except (ValueError, OSError) as error:
+        raise CliError(" ".join(str(error).split())) from error
+    return 0
