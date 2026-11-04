@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -14,7 +15,8 @@ from tsguard.experiment.runner import EntityRunner, FoldOutcome, RunConfig
 from tsguard.experiment.tracking import MemoryTracker, MlflowTracker, export_runs
 from tsguard.experiment.tuning import TUNING_EXPERIMENT, ObjectiveSource, tune
 from tsguard.models import Params
-from tsguard.models.space import DEFAULT_PARAMS
+from tsguard.models.space import DEFAULT_PARAMS, suggest_params
+from tsguard.repro.seeding import derive_seed
 
 # MLflow's SQLAlchemy store triggers a deprecation warning inside SQLAlchemy on first use.
 pytestmark = pytest.mark.filterwarnings("ignore:The ``noload`` loader strategy")
@@ -150,6 +152,30 @@ def test_the_seed_changes_the_sampled_configurations():
     assert [t.params for t in first.trials[1:]] != [t.params for t in second.trials[1:]]
 
 
+def test_the_sampler_seed_is_derived_from_the_seed_and_the_model():
+    seed, n_trials = 5, 14  # past the 10 random start-up trials, so the TPE model is in play
+
+    def value(params: Params) -> float:
+        return 1 - abs(float(params["k"]) - 64) / 256
+
+    def objective(trial: optuna.trial.Trial) -> float:
+        return value(suggest_params("zscore", trial))
+
+    expected = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=derive_seed(seed, "optuna", "zscore")),
+    )
+    expected.enqueue_trial(dict(DEFAULT_PARAMS["zscore"]))
+    previous = optuna.logging.get_verbosity()
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    try:
+        expected.optimize(objective, n_trials=n_trials)
+    finally:
+        optuna.logging.set_verbosity(previous)
+    result = run_tune(n_trials=n_trials, seed=seed)
+    assert [t.params for t in result.trials] == [t.params for t in expected.trials]
+
+
 def test_the_seed_and_the_model_reach_every_source():
     source = FakeSource()
     run_tune(n_trials=3, seed=7, sources=[source])
@@ -202,6 +228,20 @@ def test_tune_rejects_a_model_without_a_search_space():
 def test_a_source_without_folds_is_named():
     with pytest.raises(RuntimeError, match="empty"):
         run_tune(sources=[FakeSource("empty", folds=0)])
+
+
+def test_tune_names_the_extra_when_optuna_is_missing(monkeypatch):
+    monkeypatch.setitem(sys.modules, "optuna", None)
+    with pytest.raises(ImportError, match="experiment"):
+        run_tune()
+
+
+def test_the_mlflow_tracker_names_the_extra_when_mlflow_is_missing(monkeypatch, tmp_path: Path):
+    monkeypatch.setitem(sys.modules, "mlflow", None)
+    with pytest.raises(ImportError, match="experiment"):
+        MlflowTracker(f"sqlite:///{tmp_path}/mlruns.db")
+    with pytest.raises(ImportError, match="experiment"):
+        export_runs(f"sqlite:///{tmp_path}/mlruns.db", tmp_path / "runs.csv", experiments=["x"])
 
 
 def test_memory_tracker_numbers_its_runs():
@@ -317,9 +357,41 @@ def test_export_names_a_run_that_this_tracker_did_not_write(tmp_path: Path):
     uri = f"sqlite:///{tmp_path}/mlruns.db"
     client = mlflow.MlflowClient(tracking_uri=uri)
     exp_id = client.create_experiment("x")
-    client.create_run(exp_id, run_name="foreign")
+    foreign = client.create_run(exp_id, run_name="foreign")
+    client.set_terminated(foreign.info.run_id, status="FINISHED")
     with pytest.raises(ValueError, match="foreign"):
         export_runs(uri, tmp_path / "runs.csv", experiments=["x"])
+
+
+def test_export_skips_the_runs_that_did_not_finish(tmp_path: Path):
+    import mlflow
+
+    uri = f"sqlite:///{tmp_path}/mlruns.db"
+    tracker = MlflowTracker(uri)
+    tags = {"kind": "trial", "model": "zscore"}
+    good = tracker.log_run(
+        experiment="x", run_name="good", params={"k": 1}, metrics={"objective": 0.5}, tags=tags
+    )
+    with pytest.raises(mlflow.exceptions.MlflowException):
+        tracker.log_run(
+            experiment="x",
+            run_name="bad",
+            params={"k": 2},
+            metrics={"not a valid name?": 1.0},
+            tags=tags,
+        )
+    client = mlflow.MlflowClient(tracking_uri=uri)
+    experiment = client.get_experiment_by_name("x")
+    assert experiment is not None
+    client.create_run(experiment.experiment_id, run_name="still-running")
+    statuses = {
+        r.info.run_name: r.info.status for r in client.search_runs([experiment.experiment_id])
+    }
+    assert statuses == {"good": "FINISHED", "bad": "FAILED", "still-running": "RUNNING"}
+    assert export_runs(uri, tmp_path / "runs.csv", experiments=["x"]) == 1
+    with open(tmp_path / "runs.csv", newline="") as f:
+        (row,) = csv.DictReader(f)
+    assert (row["run_id"], row["run_name"]) == (good, "good")
 
 
 def test_a_run_that_cannot_be_logged_is_marked_failed(tmp_path: Path):
@@ -375,6 +447,7 @@ def test_mlflow_tracker_does_not_touch_the_global_tracking_uri(tmp_path: Path):
         experiment="x", run_name="a", params={}, metrics={}, tags={}
     )
     assert mlflow.get_tracking_uri() == before
+    assert mlflow.active_run() is None
 
 
 def test_tuning_into_mlflow_records_every_trial(tmp_path: Path):

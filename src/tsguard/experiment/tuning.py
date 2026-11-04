@@ -117,11 +117,17 @@ def tune(
         The best configuration and every trial.
 
     Raises:
+        ImportError: The ``experiment`` extra (Optuna) is not installed.
         ValueError: ``model`` has no search space, ``n_trials`` is below 1, there is no
             source, or two sources share an entity name.
         RuntimeError: A source returned no fold outcomes or a non-finite objective.
     """
-    import optuna
+    try:
+        import optuna
+    except ImportError as exc:
+        raise ImportError(
+            "tuning needs the 'experiment' extra: uv sync --extra experiment"
+        ) from exc
 
     if model not in DEFAULT_PARAMS:
         valid = ", ".join(DEFAULT_PARAMS)

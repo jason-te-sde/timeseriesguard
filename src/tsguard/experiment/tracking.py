@@ -39,6 +39,7 @@ CSV_COLUMNS: Final[tuple[str, ...]] = (
 """Columns of the CSV `export_runs` writes."""
 
 _PAGE_SIZE: Final = 500
+_FINISHED: Final = "attributes.status = 'FINISHED'"
 
 
 class Tracker(Protocol):
@@ -228,6 +229,8 @@ def export_runs(tracking_uri: str, path: Path, *, experiments: Sequence[str]) ->
     The columns are `CSV_COLUMNS`. Rows are sorted by experiment name and then run name, so
     the file does not depend on the order the runs were logged or the store returns them in.
     ``params_json`` is canonical JSON of the params as they were logged, with their types.
+    Only FINISHED runs are exported: a run `MlflowTracker` could not log is closed as FAILED,
+    and one still in progress is incomplete, so neither belongs in a report.
 
     Args:
         tracking_uri: MLflow tracking URI of the store to read.
@@ -252,6 +255,7 @@ def export_runs(tracking_uri: str, path: Path, *, experiments: Sequence[str]) ->
         while True:
             page = client.search_runs(
                 [experiment.experiment_id],
+                filter_string=_FINISHED,
                 order_by=["attributes.start_time ASC"],
                 max_results=_PAGE_SIZE,
                 page_token=token,
