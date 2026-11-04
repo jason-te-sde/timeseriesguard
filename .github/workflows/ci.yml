@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # `uv run` re-resolves the interpreter from .python-version and would silently replace
+      # an environment synced for another Python. Pinning UV_PYTHON keeps sync and run aligned.
+      UV_PYTHON: "3.11"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.12.19"
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --all-extras --group dev --python 3.11 --locked
+      - name: Lint
+        run: make lint
+      - name: Type check
+        run: make type
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    env:
+      UV_PYTHON: ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.12.19"
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --all-extras --group dev --python ${{ matrix.python }} --locked
+      - name: Test
+        run: make test PYTEST_ARGS="--junitxml=reports-ci/junit.xml"
+      - name: Keep the evidence of a failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-evidence-py${{ matrix.python }}
+          path: |
+            .pytest_cache
+            reports-ci/junit.xml
+          include-hidden-files: true
+          if-no-files-found: warn
+
+  hygiene:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Reject co-author trailers
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            messages="$(git log --format=%B "origin/${BASE_REF}..HEAD")"
+          else
+            messages="$(git log -1 --format=%B HEAD)"
+          fi
+          if printf '%s\n' "$messages" | grep -iE '^co-authored-by:'; then
+            echo "::error::A commit message carries a Co-Authored-By trailer. Remove it before merging."
+            exit 1
+          fi
