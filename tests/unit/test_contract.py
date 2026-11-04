@@ -180,3 +180,89 @@ def test_contract_errors_are_tsguard_errors():
     train, test, labels = valid_inputs()
     with pytest.raises(TsguardError):
         check_entity("e", train, test, labels[:-1])
+
+
+def test_a_single_non_finite_value_is_counted_in_the_singular():
+    train, test, labels = valid_inputs()
+    test[500, 3] = np.nan
+    with pytest.raises(ContractError) as excinfo:
+        check_entity("e", train, test, labels)
+    assert "has 1 non-finite value," in str(excinfo.value)
+
+
+def test_several_non_finite_values_are_counted_in_the_plural():
+    train, test, labels = valid_inputs()
+    test[500, 3] = np.nan
+    test[501, 3] = np.inf
+    with pytest.raises(ContractError) as excinfo:
+        check_entity("e", train, test, labels)
+    assert "has 2 non-finite values," in str(excinfo.value)
+
+
+def test_a_single_out_of_range_value_is_counted_in_the_singular():
+    train, test, labels = valid_inputs()
+    train[7, 2] = 1.5
+    with pytest.raises(ContractError) as excinfo:
+        check_entity("e", train, test, labels)
+    assert "has 1 value outside" in str(excinfo.value)
+
+
+def test_several_out_of_range_values_are_counted_in_the_plural():
+    train, test, labels = valid_inputs()
+    train[7, 2] = 1.5
+    train[8, 2] = -0.5
+    with pytest.raises(ContractError) as excinfo:
+        check_entity("e", train, test, labels)
+    assert "has 2 values outside" in str(excinfo.value)
+
+
+def test_the_out_of_range_value_is_printed_as_a_plain_number():
+    train, test, labels = valid_inputs()
+    train[7, 2] = 1.5
+    with pytest.raises(ContractError) as excinfo:
+        check_entity("e", train, test, labels)
+    message = str(excinfo.value)
+    assert "(1.5)" in message
+    assert "np." not in message
+
+
+def test_a_single_bad_label_is_counted_in_the_singular_and_printed_as_a_plain_number():
+    train, test, labels = valid_inputs()
+    labels[3] = 2
+    with pytest.raises(ContractError) as excinfo:
+        check_entity("e", train, test, labels)
+    message = str(excinfo.value)
+    assert "1 does not, first at row 3 (2)" in message
+    assert "np." not in message
+
+
+def test_several_bad_labels_are_counted_in_the_plural():
+    train, test, labels = valid_inputs()
+    labels[3] = 2
+    labels[4] = 3
+    with pytest.raises(ContractError) as excinfo:
+        check_entity("e", train, test, labels)
+    assert "2 do not, first at row 3 (2)" in str(excinfo.value)
+
+
+def test_a_bad_float_label_keeps_its_fraction_in_the_message():
+    train, test, labels = valid_inputs()
+    fractional = labels.astype(np.float64)
+    fractional[3] = 0.5
+    with pytest.raises(ContractError) as excinfo:
+        check_entity("e", train, test, fractional)
+    assert "first at row 3 (0.5)" in str(excinfo.value)
+
+
+def test_a_single_row_is_counted_in_the_singular():
+    train, test, labels = valid_inputs()
+    with pytest.raises(ContractError) as excinfo:
+        check_entity("e", train[:1], test, labels)
+    assert "train has 1 row, need" in str(excinfo.value)
+
+
+def test_a_single_label_row_is_counted_in_the_singular():
+    train, test, labels = valid_inputs()
+    with pytest.raises(ContractError) as excinfo:
+        check_entity("e", train, test, labels[:1])
+    assert "labels has 1 row but" in str(excinfo.value)

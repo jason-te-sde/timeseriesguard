@@ -51,9 +51,14 @@ def check_entity(name: str, train: np.ndarray, test: np.ndarray, labels: np.ndar
     _check_labels(name, labels)
     if len(labels) != len(test):
         raise ContractError(
-            f"{name}: rule 6 (label length): labels has {len(labels):,} rows but test has "
+            f"{name}: rule 6 (label length): labels has {_count(len(labels), 'row')} but test has "
             f"{len(test):,}; there must be one label per test row"
         )
+
+
+def _count(count: int, noun: str) -> str:
+    """Return ``count`` with a thousands separator and ``noun`` pluralised by an ``s``."""
+    return f"{count:,} {noun}" if count == 1 else f"{count:,} {noun}s"
 
 
 def _check_shape(name: str, split: str, array: np.ndarray) -> None:
@@ -78,8 +83,8 @@ def _check_shape(name: str, split: str, array: np.ndarray) -> None:
 def _check_rows(name: str, split: str, array: np.ndarray) -> None:
     if len(array) < MIN_ROWS:
         raise ContractError(
-            f"{name}: rule 2 (rows): {split} has {len(array):,} rows, need at least "
-            f"{MIN_ROWS:,} rows"
+            f"{name}: rule 2 (rows): {split} has {_count(len(array), 'row')}, need at least "
+            f"{_count(MIN_ROWS, 'row')}"
         )
 
 
@@ -88,7 +93,7 @@ def _check_finite(name: str, split: str, array: np.ndarray) -> None:
     if bad.any():
         row, column = (int(i) for i in np.argwhere(bad)[0])
         raise ContractError(
-            f"{name}: rule 3 (finite): {split} has {int(bad.sum()):,} non-finite values, "
+            f"{name}: rule 3 (finite): {split} has {_count(int(bad.sum()), 'non-finite value')}, "
             f"first at row {row}, column {column}"
         )
 
@@ -97,9 +102,10 @@ def _check_range(name: str, split: str, array: np.ndarray) -> None:
     bad = (array < 0.0) | (array > 1.0)
     if bad.any():
         row, column = (int(i) for i in np.argwhere(bad)[0])
+        first = float(array[row, column])
         raise ContractError(
-            f"{name}: rule 4 (range): {split} has {int(bad.sum()):,} values outside "
-            f"[0.0, 1.0], first at row {row}, column {column} ({array[row, column]!r})"
+            f"{name}: rule 4 (range): {split} has {_count(int(bad.sum()), 'value')} "
+            f"outside [0.0, 1.0], first at row {row}, column {column} ({first!r})"
         )
 
 
@@ -110,7 +116,9 @@ def _check_labels(name: str, labels: np.ndarray) -> None:
     bad = ~np.isin(labels, (0, 1))
     if bad.any():
         row = int(np.argmax(bad))
+        count = int(bad.sum())
         raise ContractError(
             f"{name}: rule 5 (labels): labels must have values in {{0, 1}}; "
-            f"{int(bad.sum()):,} do not, first at row {row} ({labels[row]!r})"
+            f"{count:,} {'does' if count == 1 else 'do'} not, first at row {row} "
+            f"({labels[row].item()!r})"
         )
