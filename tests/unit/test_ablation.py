@@ -206,6 +206,9 @@ def make_fake_world(
                 threshold=SimpleNamespace(reads_before=reads_before),
             )
 
+        def drop_seed_caches(self, seed):
+            pass
+
     def fake_evaluate(selection, labels, audit, params):
         f1 = f1_of(selection.entity, selection.seed, selection.n_specs)
         score = ProtocolScore(auc_pr=f1 / 2, f1=f1, f1_oracle=1.0)

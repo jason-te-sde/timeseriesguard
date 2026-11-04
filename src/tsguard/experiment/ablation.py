@@ -204,7 +204,8 @@ def _run_entity(
         for model in models:
             full, reduced = (runner.select(model, params[model], seed=seed) for runner in arms)
             selections[(model, seed)] = (full, reduced)
-        # Call EntityRunner.drop_seed_caches(seed) here once it is committed: the seed is done.
+        for runner in arms:
+            runner.drop_seed_caches(seed)  # this seed's validation rows are no longer needed
     _check_selected_before_reading(name, audit, selections)
     out: dict[_Cell, tuple[_Score, _Score]] = {}
     for (model, seed), pair in selections.items():
