@@ -8,7 +8,9 @@ from pathlib import Path
 import optuna
 import pytest
 
-from tsguard.experiment.runner import FoldOutcome
+from tests.conftest import make_entity
+from tsguard.data.labels import LabelAudit
+from tsguard.experiment.runner import EntityRunner, FoldOutcome, RunConfig
 from tsguard.experiment.tracking import MemoryTracker, MlflowTracker, export_runs
 from tsguard.experiment.tuning import TUNING_EXPERIMENT, ObjectiveSource, tune
 from tsguard.models import Params
@@ -385,3 +387,19 @@ def test_tuning_into_mlflow_records_every_trial(tmp_path: Path):
     assert [r["run_id"] for r in rows] == [t.run_id for t in result.trials]
     assert [json.loads(r["params_json"]) for r in rows] == [t.params for t in result.trials]
     assert [float(r["objective"]) for r in rows] == [t.value for t in result.trials]
+
+
+def test_an_entity_runner_is_an_objective_source_that_tune_can_search():
+    audit = LabelAudit()
+    data = make_entity(n_train=3000, n_test=1000, anomalies=((300, 20),), audit=audit)
+    runner = EntityRunner(data, audit, RunConfig(ae_epochs=1, threads=1))
+    source: ObjectiveSource = runner
+    tracker = MemoryTracker()
+    result = tune("zscore", [source], n_trials=2, seed=0, tracker=tracker)
+    assert [r["run_name"] for r in tracker.runs] == ["zscore-trial-00", "zscore-trial-01"]
+    metrics = tracker.runs[0]["metrics"]
+    assert isinstance(metrics, dict)
+    assert set(metrics) == {"objective", f"objective.{data.name}"}
+    assert result.trials[0].value == pytest.approx(
+        sum(o.objective for o in runner.objective("zscore", DEFAULT_PARAMS["zscore"], seed=0)) / 3
+    )

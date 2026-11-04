@@ -31,13 +31,12 @@ FINAL_EXPERIMENT: Final = "tsguard-final"
 
 
 class ObjectiveSource(Protocol):
-    """Anything that scores a configuration on one entity; `EntityRunner` is one.
+    """Anything that scores a configuration on one entity; `EntityRunner` is one."""
 
-    Attributes:
-        entity: Name of the entity, used to name the per-entity metric of each trial.
-    """
-
-    entity: str
+    @property
+    def entity(self) -> str:
+        """Name of the entity, used to name the per-entity metric of each trial."""
+        ...
 
     def objective(
         self, model: str, params: Params, *, seed: int | None = None
