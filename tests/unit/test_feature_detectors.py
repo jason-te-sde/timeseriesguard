@@ -242,12 +242,14 @@ def test_unknown_param_key_is_value_error():
 
 
 def test_every_registered_model_builds_a_detector_from_its_defaults():
-    assert MODEL_NAMES == ("zscore", "iforest")
+    assert MODEL_NAMES == ("zscore", "iforest", "cnn_ae", "lstm_ae")
     assert FEATURE_MODELS == ("zscore", "iforest")
     for name in MODEL_NAMES:
         detector = build_detector(name, DEFAULT_PARAMS[name], seed=0)
         assert isinstance(detector, Detector)
         assert detector.name == name
+    for name in FEATURE_MODELS:
+        detector = build_detector(name, DEFAULT_PARAMS[name], seed=0)
         assert detector.input_kind == "features"
         assert detector.lookback == 1
 

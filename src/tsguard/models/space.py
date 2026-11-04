@@ -20,6 +20,8 @@ DEFAULT_PARAMS: Final[Mapping[str, Mapping[str, int | float | str]]] = MappingPr
         "iforest": MappingProxyType(
             {"n_estimators": 200, "max_samples": 1024, "max_features": 0.5}
         ),
+        "cnn_ae": MappingProxyType({"window": 32, "width": 64, "latent": 8, "lr": 1e-3}),
+        "lstm_ae": MappingProxyType({"window": 32, "hidden": 64, "latent": 8, "lr": 1e-3}),
     }
 )
 
@@ -32,7 +34,7 @@ def suggest_params(name: str, trial: optuna.trial.BaseTrial) -> dict[str, int | 
     suggested names never depends on an earlier suggestion.
 
     Args:
-        name: A model with a search space: ``"zscore"`` or ``"iforest"``.
+        name: A model with a search space: any name in `DEFAULT_PARAMS`.
         trial: The Optuna trial to draw from. Only its ``suggest_*`` methods are called.
 
     Returns:
@@ -52,6 +54,20 @@ def suggest_params(name: str, trial: optuna.trial.BaseTrial) -> dict[str, int | 
                 "n_estimators": trial.suggest_int("n_estimators", 100, 400, step=50),
                 "max_samples": trial.suggest_int("max_samples", 256, 4096, log=True),
                 "max_features": trial.suggest_float("max_features", 0.1, 1.0),
+            }
+        case "cnn_ae":
+            return {
+                "window": trial.suggest_categorical("window", [16, 32, 64]),
+                "width": trial.suggest_categorical("width", [32, 64, 128]),
+                "latent": trial.suggest_categorical("latent", [4, 8, 16]),
+                "lr": trial.suggest_float("lr", 1e-4, 3e-3, log=True),
+            }
+        case "lstm_ae":
+            return {
+                "window": trial.suggest_categorical("window", [16, 32, 64]),
+                "hidden": trial.suggest_categorical("hidden", [32, 64, 128]),
+                "latent": trial.suggest_categorical("latent", [4, 8, 16]),
+                "lr": trial.suggest_float("lr", 1e-4, 3e-3, log=True),
             }
         case _:
             valid = ", ".join(DEFAULT_PARAMS)
