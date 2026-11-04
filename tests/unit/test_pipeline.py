@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import warnings
+from collections.abc import Sequence
 
 import numpy as np
 import pytest
 
 from tests.conftest import CONSTANT_CHANNEL, make_entity
 from tsguard.errors import GUARD_FIT_END, LeakageError
-from tsguard.features.pipeline import RAW_SPECS, FeaturePipeline, compute_raw_features
-from tsguard.features.specs import FEATURE_SPECS, MAX_LOOKBACK, FeatureSpec
+from tsguard.features.pipeline import (
+    MIN_SCALE,
+    RAW_SPECS,
+    FeaturePipeline,
+    compute_raw_features,
+)
+from tsguard.features.specs import FEATURE_SPECS, MAX_LOOKBACK, BlockCache, FeatureSpec
 
 N_CHANNELS = 38
 N_COLUMNS = 59 * N_CHANNELS + 4
@@ -81,8 +87,9 @@ def test_test_rows_see_train_history(fitted, evaluated, full, entity):
     head = raw[:end]
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        mean, scale = np.nanmean(head, axis=0), np.nanstd(head, axis=0)
-    scale = np.where((scale == 0.0) | np.isnan(scale), 1.0, scale)
+        low, high = np.nanmin(head, axis=0), np.nanmax(head, axis=0)
+        mean = np.where(low == high, low, np.nanmean(head, axis=0))
+        scale = np.maximum(np.nanstd(head, axis=0), MIN_SCALE)
     expected = np.nan_to_num((raw[end] - np.nan_to_num(mean)) / scale)
     np.testing.assert_allclose(evaluated[0], expected, rtol=1e-4, atol=1e-5)
 
@@ -291,6 +298,14 @@ def test_state_digest_is_stable_and_sensitive(full, entity):
     assert a != FeaturePipeline(RAW_SPECS).fit(full, end_index=end).state_digest()
 
 
+def test_state_digest_changes_with_the_fit_data_at_the_same_end_index(full, entity, rng):
+    end = entity.train_end
+    other = full.copy()
+    other[:end] += 0.01 * rng.standard_normal(other[:end].shape)
+    a = FeaturePipeline().fit(full, end_index=end).state_digest()
+    assert a != FeaturePipeline().fit(other, end_index=end).state_digest()
+
+
 def test_a_fit_too_short_for_any_window_neither_warns_nor_yields_nan(full):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
@@ -329,3 +344,130 @@ def test_in_sample_transform_needs_the_fit_rows(full, fitted, entity):
 def test_zero_channels_is_value_error():
     with pytest.raises(ValueError, match="n_channels"):
         FeaturePipeline(RAW_SPECS, n_channels=0)
+
+
+def _cols(pipeline: FeaturePipeline, channel: int) -> list[int]:
+    suffix = f"[c{channel:02d}]"
+    return [i for i, name in enumerate(pipeline.columns) if name.endswith(suffix)]
+
+
+@pytest.mark.parametrize("constant", [0.1, 1.0 / 3.0, 0.7])
+def test_a_constant_channel_standardizes_to_exactly_zero(full, entity, constant):
+    x = full.copy()
+    x[:, CONSTANT_CHANNEL] = constant
+    p = FeaturePipeline()
+    out = p.fit_transform(x, end_index=entity.train_end)
+    cols = _cols(p, CONSTANT_CHANNEL)
+    assert len(cols) == 59
+    assert (out[:, cols] == 0.0).all()
+    assert (p.transform(x, start_index=entity.train_end)[:, cols] == 0.0).all()
+
+
+def test_a_shifted_constant_channel_is_scaled_by_the_floor(full, entity):
+    end = entity.train_end
+    x = full.copy()
+    x[:end, CONSTANT_CHANNEL] = 0.1
+    x[end:, CONSTANT_CHANNEL] = 0.2
+    expected = (0.2 - 0.1) / MIN_SCALE
+
+    raw = FeaturePipeline(RAW_SPECS)
+    raw.fit(x, end_index=end)
+    shifted = raw.transform(x, start_index=end)[:, CONSTANT_CHANNEL]
+    np.testing.assert_allclose(shifted, expected, rtol=1e-6)
+
+    p = FeaturePipeline().fit(x, end_index=end)
+    out = p.transform(x, start_index=end)
+    lags = [i for i in _cols(p, CONSTANT_CHANNEL) if p.columns[i].startswith("lag_")]
+    assert len(lags) == 10
+    np.testing.assert_allclose(out[10:, lags], expected, rtol=1e-6)
+    assert (out[0, lags] == 0.0).all()  # the last train rows still hold 0.1, the mean
+
+
+def test_a_near_constant_column_has_the_floor_as_its_scale(full, entity, rng):
+    end = entity.train_end
+    x = full.copy()
+    x[:, 0] = 0.5 + 1e-6 * rng.standard_normal(len(x))  # std 1e-6, far below the floor
+    x[:, 1] = 0.5 + 5e-3 * rng.standard_normal(len(x))  # std 5e-3, above it
+    p = FeaturePipeline(RAW_SPECS).fit(x, end_index=end)
+    mean, scale = p._mean, p._scale
+    assert mean is not None
+    assert scale is not None
+    assert MIN_SCALE == 1e-3
+    assert scale[0] == MIN_SCALE
+    assert scale[1] == pytest.approx(5e-3, rel=0.1)
+    assert scale[1] > MIN_SCALE
+    assert mean[0] == pytest.approx(0.5, abs=1e-6)
+    assert mean[CONSTANT_CHANNEL] == 0.5  # a constant channel's mean is the constant itself
+    out = p.transform(x, start_index=end)
+    assert np.abs(out[:, 0]).max() < 0.1  # without the floor this would be of order 1
+
+
+def test_a_window_with_too_little_history_is_value_error(fitted, full, entity):
+    r = entity.train_end + 500
+    with pytest.raises(ValueError, match=r"needs 64 rows of history.*got 63"):
+        fitted.transform(full[r - 62 : r + 1], start_index=r, offset=r - 62)
+    # context rows need their own history: 64 + 1 rows are needed for context=1
+    with pytest.raises(ValueError, match=r"needs 65 rows of history.*got 64"):
+        fitted.transform(full[r - 63 : r + 1], start_index=r, context=1, offset=r - 63)
+    out = fitted.transform(full[r - 64 : r + 1], start_index=r, context=1, offset=r - 64)
+    assert out.shape == (2, N_COLUMNS)
+    assert np.isfinite(out).all()
+
+
+def test_a_series_that_starts_at_row_zero_may_be_evaluated_cold(full):
+    p = FeaturePipeline().fit(full, end_index=1)
+    out = p.transform(full[:20], start_index=1)  # offset 0: the warmup is the series start
+    assert out.shape == (19, N_COLUMNS)
+    assert np.isfinite(out).all()
+
+
+def _flaky(state: dict[str, bool], lookback: int = 1, rows: Sequence[int] = ()) -> FeatureSpec:
+    """A spec that returns NaN in channel 2 on the given block rows, or on the last row."""
+
+    def fn(block: np.ndarray, cache: BlockCache) -> np.ndarray:
+        out = block.copy()
+        if state["nan"]:
+            out[list(rows) if rows else -1, 2] = np.nan
+        return out
+
+    return FeatureSpec("flaky", "toy", lookback, "channel", fn)
+
+
+def test_nan_after_the_warmup_is_a_runtime_error_on_every_path(full, entity):
+    end = entity.train_end
+    state = {"nan": False}
+    p = FeaturePipeline((_flaky(state),)).fit(full, end_index=end)
+    digest = p.state_digest()
+    state["nan"] = True
+    with pytest.raises(RuntimeError, match=rf"flaky\[c02\].*row {end - 1}\b"):
+        p.transform_in_sample(full)
+    with pytest.raises(RuntimeError, match=rf"flaky\[c02\].*row {len(full) - 1}\b"):
+        p.transform(full, start_index=end)
+    with pytest.raises(RuntimeError, match=rf"flaky\[c02\].*row {end - 1}\b"):
+        p.fit(full, end_index=end)
+    with pytest.raises(RuntimeError, match=rf"flaky\[c02\].*row {end - 1}\b"):
+        p.fit_transform(full, end_index=end)
+    assert p.state_digest() == digest  # a refused fit leaves the fitted state alone
+    fresh = FeaturePipeline((_flaky(state),))
+    with pytest.raises(RuntimeError, match="flaky"):
+        fresh.fit(full, end_index=end)
+    assert fresh.fit_end is None
+
+
+@pytest.mark.parametrize(
+    ("lookback", "rows", "bad_row"),
+    [(1, (0,), 0), (3, (0, 1, 2), 2), (3, (1, 5), 5)],
+)
+def test_nan_beyond_a_specs_declared_warmup_is_refused(full, lookback, rows, bad_row):
+    spec = _flaky({"nan": True}, lookback=lookback, rows=rows)
+    with pytest.raises(RuntimeError, match=rf"flaky\[c02\].*row {bad_row}\b"):
+        FeaturePipeline((spec,)).fit(full, end_index=300)
+
+
+def test_nan_inside_the_declared_warmup_is_zero_after_standardizing(full):
+    spec = _flaky({"nan": True}, lookback=3, rows=(0, 1))
+    p = FeaturePipeline((spec,))
+    out = p.fit_transform(full, end_index=300)
+    assert np.isfinite(out).all()
+    assert (out[:2, 2] == 0.0).all()
+    assert out[2, 2] != 0.0

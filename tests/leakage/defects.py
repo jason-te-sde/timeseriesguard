@@ -4,7 +4,9 @@ Test support, not shipped. Each feature defect is a channel spec like the real o
 function of the whole block ``(m, c)``, with a dishonest ``lookback`` of 1: it claims to read
 only the current row while it reads the rest of the block, which is how a pipeline that feeds
 history and future in one array leaks. The pipeline cuts its blocks at fixed rows, so the
-leak shows on every row of a block that has rows after it.
+leak shows on every row of a block that has rows after it. None of them returns NaN: the
+pipeline refuses a NaN past a spec's warmup (and these specs claim a lookback of 1, so they
+have none), and a refusal would hide the leak from the guard that is meant to catch it.
 
 The pipeline defects subclass `FeaturePipeline` and break the one rule it exists to keep:
 the standardization is fitted on the rows before ``end_index`` and on nothing else.
@@ -59,12 +61,12 @@ def _above_median(block: np.ndarray) -> np.ndarray:
 
 
 def _centered_rolling(block: np.ndarray, cache: BlockCache) -> np.ndarray:
-    mean = pd.DataFrame(block).rolling(5, center=True).mean()
+    mean = pd.DataFrame(block).rolling(5, center=True).mean().fillna(0.0)
     return np.asarray(mean.to_numpy(dtype=np.float64))
 
 
 def _bfill(block: np.ndarray, cache: BlockCache) -> np.ndarray:
-    filled = pd.DataFrame(block).where(_above_median(block)).bfill()
+    filled = pd.DataFrame(block).where(_above_median(block)).bfill().fillna(0.0)
     return np.asarray(filled.to_numpy(dtype=np.float64))
 
 
@@ -75,7 +77,8 @@ def _whole_series_fft(block: np.ndarray, cache: BlockCache) -> np.ndarray:
 
 
 def _interpolate_both(block: np.ndarray, cache: BlockCache) -> np.ndarray:
-    filled = pd.DataFrame(block).where(_above_median(block)).interpolate(limit_direction="both")
+    gaps = pd.DataFrame(block).where(_above_median(block))
+    filled = gaps.interpolate(limit_direction="both").fillna(0.0)
     return np.asarray(filled.to_numpy(dtype=np.float64))
 
 

@@ -5,6 +5,10 @@ mean and one scale per feature column, computed from the fit rows only. Evaluati
 rows afterwards would grade a detector on data its inputs were scaled with, so
 `FeaturePipeline.transform` refuses a start row before the fit end.
 
+A column that is constant over the fit rows standardizes to exactly zero, and no scale is
+below `MIN_SCALE`. NaN is legal only in the warmup at the series start, where it becomes 0.0;
+anywhere else it is an error, so a broken spec cannot hide behind a zero fill.
+
 Features are computed in blocks of output rows. Every spec's value at a row depends only on
 the trailing ``lookback`` rows, so each block is fed ``MAX_LOOKBACK - 1`` rows of history
 before it and the result does not depend on the block size.
@@ -23,6 +27,14 @@ from tsguard.errors import GUARD_FIT_END, LeakageError
 from tsguard.features.specs import FEATURE_SPECS, MAX_LOOKBACK, BlockCache, FeatureSpec
 
 DEFAULT_BLOCK: Final = 4096
+MIN_SCALE: Final = 1e-3
+"""Smallest scale a column is divided by.
+
+SMD is min-max scaled to [0, 1] per channel, so a change below 0.1 % of a channel's range
+is noise. Without a floor, a near-constant channel (machine-1-1 channel 33 has a train scale of
+about 3e-6) turns the first real movement of the test rows into a value of 1e5 standard
+deviations, which swamps every detector.
+"""
 _STAT_COLUMNS: Final = 256  # columns reduced at once; bounds the temporaries of nanmean/nanstd
 
 RAW_SPECS: Final[tuple[FeatureSpec, ...]] = (
@@ -58,6 +70,20 @@ def _column_names(specs: Sequence[FeatureSpec], n_channels: int) -> tuple[str, .
     ]
     entity = [spec.name for spec in specs if spec.scope == "entity"]
     return (*channel, *entity)
+
+
+def _warmup_groups(
+    specs: Sequence[FeatureSpec], n_channels: int
+) -> tuple[tuple[int, np.ndarray], ...]:
+    """Group the columns by the number of warmup rows their spec may leave NaN."""
+    warmup = [
+        spec.lookback - 1 for spec in specs if spec.scope == "channel" for _ in range(n_channels)
+    ]
+    warmup += [spec.lookback - 1 for spec in specs if spec.scope == "entity"]
+    column_warmup = np.array(warmup)
+    return tuple(
+        (int(rows), np.flatnonzero(column_warmup == rows)) for rows in np.unique(column_warmup)
+    )
 
 
 def _check_channels(x: np.ndarray, n_channels: int) -> None:
@@ -136,8 +162,11 @@ def compute_raw_features(
 def _column_statistics(raw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Return per-column ``(mean, scale)`` of the non-NaN values of ``raw``.
 
-    A scale of 0 or NaN becomes 1.0 and a mean of NaN becomes 0.0, so a constant column
-    standardizes to exactly zero and a column with no value at all passes through.
+    The mean of a column whose values are all equal is that value, exactly: the arithmetic
+    mean of ``n`` copies of 0.1 misses it by about 1e-15, which would leave a constant
+    column standardized to noise instead of zero. The scale is the standard deviation, at
+    least `MIN_SCALE`. A column with no value at all gets mean 0.0 and scale 1.0, so it
+    passes through.
     """
     n_columns = raw.shape[1]
     mean = np.empty(n_columns)
@@ -146,10 +175,12 @@ def _column_statistics(raw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         warnings.simplefilter("ignore", RuntimeWarning)  # an all-NaN column warns, then is NaN
         for lo in range(0, n_columns, _STAT_COLUMNS):
             hi = min(lo + _STAT_COLUMNS, n_columns)
-            mean[lo:hi] = np.nanmean(raw[:, lo:hi], axis=0)
-            scale[lo:hi] = np.nanstd(raw[:, lo:hi], axis=0)
+            chunk = raw[:, lo:hi]
+            low, high = np.nanmin(chunk, axis=0), np.nanmax(chunk, axis=0)
+            mean[lo:hi] = np.where(low == high, low, np.nanmean(chunk, axis=0))
+            scale[lo:hi] = np.nanstd(chunk, axis=0)
     mean[np.isnan(mean)] = 0.0
-    scale[(scale == 0.0) | np.isnan(scale)] = 1.0
+    scale = np.where(np.isnan(scale), 1.0, np.maximum(scale, MIN_SCALE))
     mean.flags.writeable = False
     scale.flags.writeable = False
     return mean, scale
@@ -191,6 +222,7 @@ class FeaturePipeline:
         self._n_channels = n_channels
         self.columns: tuple[str, ...] = _column_names(self._specs, n_channels)
         self.lookback: int = max(spec.lookback for spec in self._specs)
+        self._warmup_groups = _warmup_groups(self._specs, n_channels)
         self._fit_end: int | None = None
         self._mean: np.ndarray | None = None
         self._scale: np.ndarray | None = None
@@ -215,12 +247,41 @@ class FeaturePipeline:
         if not 1 <= end_index <= len(x):
             raise ValueError(f"end_index must be in [1, {len(x)}], got {end_index}")
 
+    def _reject_unexpected_nan(self, raw: np.ndarray, first_row: int) -> None:
+        """Raise if ``raw`` holds NaN anywhere but in a spec's warmup at the series start.
+
+        A spec may be NaN for the absolute rows below its ``lookback - 1``, because the
+        series has not yet supplied a full window. Anywhere else a NaN means a spec has
+        regressed, and zero-filling it would hide the regression inside a plausible number.
+
+        Args:
+            raw: Unscaled features of the absolute rows ``[first_row, first_row + len(raw))``.
+            first_row: Absolute index of the first row of ``raw``.
+
+        Raises:
+            RuntimeError: A NaN lies outside the warmup; the message names the column and
+                the absolute row of the first one.
+        """
+        nan = np.isnan(raw)
+        for warmup, columns in self._warmup_groups:
+            rows = min(max(warmup - first_row, 0), len(raw))
+            if rows:
+                nan[:rows, columns] = False
+        if nan.any():
+            row, column = divmod(int(np.argmax(nan)), nan.shape[1])
+            raise RuntimeError(
+                f"feature column {self.columns[column]!r} is NaN at row {first_row + row}, "
+                f"past its warmup ({int(nan.sum())} such values in all); "
+                f"a spec must not return NaN for a row with a full window"
+            )
+
     def _fit_rows(self, x: np.ndarray, end_index: int) -> np.ndarray:
         """Compute the raw features of ``x[:end_index]`` and store their statistics."""
         self._check_fit_end(x, end_index)
         raw = compute_raw_features(
             x[:end_index], self._specs, rows=(0, end_index), n_channels=self._n_channels
         )
+        self._reject_unexpected_nan(raw, 0)
         mean, scale = _column_statistics(raw)
         self._fit_end, self._mean, self._scale = end_index, mean, scale
         return raw
@@ -238,6 +299,7 @@ class FeaturePipeline:
         Raises:
             ValueError: ``end_index`` is outside ``[1, len(X)]`` or ``X`` has the wrong
                 number of channels.
+            RuntimeError: A spec returned NaN past its warmup; the pipeline is left as it was.
         """
         self._fit_rows(X, end_index)
         return self
@@ -254,6 +316,7 @@ class FeaturePipeline:
 
         Raises:
             ValueError: As `fit`.
+            RuntimeError: As `fit`.
         """
         raw = self._fit_rows(X, end_index)
         _, mean, scale = self._require_fitted()
@@ -270,7 +333,7 @@ class FeaturePipeline:
             Float32 ``(fit_end, len(columns))``, C-contiguous.
 
         Raises:
-            RuntimeError: The pipeline is not fitted.
+            RuntimeError: The pipeline is not fitted, or a spec returned NaN past its warmup.
             ValueError: ``X`` has the wrong number of channels or fewer than ``fit_end`` rows.
         """
         fit_end, mean, scale = self._require_fitted()
@@ -282,6 +345,7 @@ class FeaturePipeline:
         raw = compute_raw_features(
             X[:fit_end], self._specs, rows=(0, fit_end), n_channels=self._n_channels
         )
+        self._reject_unexpected_nan(raw, 0)
         return _standardize(raw, mean, scale)
 
     def transform(
@@ -297,6 +361,9 @@ class FeaturePipeline:
         ``context`` extra rows before ``start_index`` are returned too, for detectors that
         need a window; they may lie inside the fit range, because reading history is
         legal. Only the input rows from ``start_index - context - lookback + 1`` on are read.
+        With ``offset == 0``, ``X`` is the series itself and the first ``lookback - 1`` rows
+        are the warmup, which standardizes to 0.0; with ``offset > 0`` the window must
+        carry that history in full.
 
         Args:
             X: Channel values ``(n, n_channels)``; ``X[0]`` is absolute row ``offset``.
@@ -309,12 +376,14 @@ class FeaturePipeline:
             C-contiguous.
 
         Raises:
-            RuntimeError: The pipeline is not fitted.
+            RuntimeError: The pipeline is not fitted, or a spec returned NaN past its warmup.
             LeakageError: ``start_index`` is before the end of the fit rows (guard
                 ``fit_end``).
             ValueError: ``X`` has the wrong number of channels, ``context`` is negative,
-                ``start_index - context`` is before ``offset``, or ``start_index`` is
-                after the last row of ``X``.
+                ``start_index - context`` is before ``offset``, ``start_index`` is after the
+                last row of ``X``, or ``offset`` is positive and fewer than
+                ``lookback - 1`` rows precede the first returned row: a window that starts
+                after the series start must carry the full history its first row needs.
         """
         fit_end, mean, scale = self._require_fitted()
         _check_channels(X, self._n_channels)
@@ -333,6 +402,13 @@ class FeaturePipeline:
                 f"start_index {start_index} with context {context} reaches row {first}, "
                 f"before offset {offset}, the first row of X"
             )
+        if offset > 0 and first - offset < self.lookback - 1:
+            raise ValueError(
+                f"needs {self.lookback + context} rows of history ending at row {start_index} "
+                f"(lookback {self.lookback}, context {context}), got {start_index - offset + 1}: "
+                f"a window that starts after the series start would hold NaN warmup rows that "
+                f"standardize to a plausible mean value"
+            )
         if start_index > offset + len(X):
             raise ValueError(
                 f"start_index {start_index} is after the last row of X, "
@@ -346,6 +422,7 @@ class FeaturePipeline:
             offset=read_from,
             n_channels=self._n_channels,
         )
+        self._reject_unexpected_nan(raw, first)
         return _standardize(raw, mean, scale)
 
     def state_digest(self) -> str:
