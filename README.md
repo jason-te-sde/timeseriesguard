@@ -50,10 +50,36 @@ shuffled split, ...) are injected on purpose, and the tests assert *which* guard
 The block below is written by `tsguard claims --write` from `reports/`: the model numbers from
 `metrics.json`, the run count from `mlflow_runs.csv` and the latency from `latency.json`. No number
 in it is typed by hand. Once `reports/` holds any `.json` or `.csv` file, CI's `claims` job fails
-when the block or `reports/claims.json` disagrees with those files. If the block is empty, the full
-run has not been committed yet.
+when the block or `reports/claims.json` disagrees with those files.
 
 <!-- claims:begin -->
+| Claim | Value |
+| --- | --- |
+| Training steps | 708,405 |
+| Test steps | 708,420 |
+| Channels | 38 |
+| Feature specs | 63 |
+| Models compared | 4 |
+| Headline model | zscore |
+| Headline event-level AUC-PR | 0.70 (95% CI 0.62 to 0.78) |
+| MLflow runs | 144 |
+| p95 HTTP round trip, client-side (ms) | 6.7 (budget 50) |
+
+Macro-mean validation objective (on injected anomalies, what the headline was chosen by) and AUC-PR under each evaluation protocol, over entities (headline model in bold):
+
+| Model | Validation objective | point_wise | point_adjust | pa_percent_k | event_level |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **zscore** | **0.671** | **0.50** | **0.85** | **0.69** | **0.70** |
+| iforest | 0.240 | 0.47 | 0.84 | 0.68 | 0.54 |
+| cnn_ae | 0.542 | 0.44 | 0.92 | 0.64 | 0.68 |
+| lstm_ae | 0.484 | 0.43 | 0.95 | 0.66 | 0.73 |
+
+Effect of the FFT features on event-level F1 and AUC-PR (mean ± sample std over seeds):
+
+| Model | ΔF1 (points) | ΔF1 (relative %) | ΔAUC-PR |
+| --- | ---: | ---: | ---: |
+| zscore | +2.5 ± 1.8 | +7.4 ± 5.5 | -0.006 ± 0.000 |
+| iforest | +2.0 ± 1.6 | +11.4 ± 8.3 | +0.013 ± 0.014 |
 <!-- claims:end -->
 
 ## Quickstart
@@ -84,6 +110,13 @@ budget (p95 below 50 ms) are described in [docs/operations.md](docs/operations.m
   tracked file had uncommitted changes) and the git tree hash of `src/` in `environment.source_tree`,
   which names the code across merges, next to the platform, the library versions and the thread
   count.
+- The committed run was made at commit `b85d382`. Its `git_sha` carries `+dirty` and it has no
+  `source_tree`, because at that commit untracked files also counted as changes, the run's own
+  output directory was untracked when it started, and `source_tree` did not exist yet; `git status`
+  in that checkout lists no tracked change after the run. The commits since then changed the CLI,
+  validation and the report schema: selecting machine-1-1 again at the current commit, with the
+  run's tuned parameters, reproduces its pipeline, detector and test-score digests, thresholds and
+  validation objectives bit for bit for all four models.
 - `reports/mlflow_runs.csv` is the export of every tracked run (8 tuning trials per model plus one
   final run per model and machine) and the source of the run count. `reports/latency.json`, written
   by `scripts/latency.py` against a running service, is the source of the latency figure: a
@@ -105,9 +138,11 @@ budget (p95 below 50 ms) are described in [docs/operations.md](docs/operations.m
   hosted runners of a private repository have 2 vCPUs, while the run is configured for four threads
   and was made on an Apple M2. Nothing here claims that workflow can re-derive the run.
 - **CI itself, so far.** The GitHub repository has not been created yet, so the workflows are
-  written and linted but have never executed, and the container image has not been built.
-- **Latency, so far.** No latency has been measured against a running service yet; the 50 ms budget
-  is asserted by the `container` CI job, which has not run.
+  written and linted but have never executed. The container image has been built and served only on
+  the M2 (Docker Desktop, linux/arm64), not on a CI runner.
+- **Latency on other hardware.** The p95 in the results block was measured on the M2 with client and
+  container on one machine, over loopback. The `container` CI job asserts the same budget on a hosted
+  runner, but it has not run.
 - **Alerting.** The service returns a score and a decision per row. Deduplication, routing and
   paging (Slack or otherwise) are out of scope.
 - **The realism of the injected anomalies.** Model selection runs on synthetic anomalies of four

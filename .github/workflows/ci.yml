@@ -332,11 +332,10 @@ jobs:
             fi
           done
           exit 1
-      # There is no headline before the full run lands, so the bundle is iforest with its default
-      # parameters. Once reports/metrics.json is committed this becomes
-      # `--metrics reports/metrics.json` in place of `--model iforest --default-params`.
+      # The headline model of the committed full run, with its tuned parameters, so the latency
+      # measured here is the one the README states.
       - name: Build the bundle
-        run: uv run tsguard bundle --entity machine-1-1 --model iforest --default-params --out artifacts/bundle/bundle.joblib
+        run: uv run tsguard bundle --entity machine-1-1 --metrics reports/metrics.json --out artifacts/bundle/bundle.joblib
       - name: Build the image and start the service
         run: docker compose up --build --wait --wait-timeout 300
       - name: Measure the latency

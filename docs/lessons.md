@@ -47,3 +47,8 @@ nearly did, what it looked like, and the rule it left behind in the code.
   choice precedes every test label, and nothing could show it did not depend on them. The tests now
   pin that the choice is made once, while every audit still shows zero reads, and they fail when the
   choice is moved after the evaluation, not only when it is removed.
+- **Label-free selection has a price, and the table shows it.** In the run committed on 2026-11-04
+  the validation objective chose the z-score (0.671, next best 0.542), while the LSTM autoencoder
+  scored higher on the test labels (event-level AUC-PR 0.73 against 0.70). Choosing by the test
+  score would have reported the higher number and made it meaningless as an estimate. Every model
+  is reported under every protocol, so the gap stays visible instead of being chosen away.

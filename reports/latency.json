@@ -1,0 +1,17 @@
+{
+  "model": "zscore",
+  "bundle_sha256": "496e6bafae2548860448f053c8b758c607a153707012993ed34e022118f60fb5",
+  "n": 2000,
+  "warmup": 100,
+  "p50_ms": 5.879,
+  "p95_ms": 6.727,
+  "p99_ms": 7.383,
+  "max_ms": 27.77,
+  "budget_ms": 50.0,
+  "url": "http://127.0.0.1:8000",
+  "environment": {
+    "platform": "macOS-26.6.2-arm64-arm-64bit",
+    "python": "3.11.15",
+    "cpu_count": 8
+  }
+}

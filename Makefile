@@ -2,7 +2,7 @@
 
 PYTEST_ARGS ?=
 ENTITY ?= machine-1-1
-BUNDLE_ARGS ?= --model iforest --default-params
+BUNDLE_ARGS ?= --metrics reports/metrics.json
 
 lint:
 	uv run ruff check .
@@ -35,9 +35,8 @@ reproduce:
 check: lint type test
 
 # Fits one machine and writes artifacts/bundle/bundle.joblib and its .sha256, which the container
-# mounts. Before the full run exists there is no headline, so the default is iforest with its
-# default parameters; once reports/metrics.json exists, build the real one with
-# `make bundle BUNDLE_ARGS="--metrics reports/metrics.json"`.
+# mounts. The default is the headline model of reports/metrics.json with its tuned parameters;
+# `make bundle BUNDLE_ARGS="--model iforest --default-params"` needs no metrics file.
 bundle:
 	uv run tsguard bundle --entity $(ENTITY) $(BUNDLE_ARGS) --out artifacts/bundle/bundle.joblib
 

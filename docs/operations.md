@@ -17,10 +17,10 @@ make container-up              # docker compose up --build --wait; stop with doc
 uv run tsguard serve --bundle artifacts/bundle/bundle.joblib
 ```
 
-`make bundle` runs `tsguard bundle --entity machine-1-1 --model iforest --default-params`, because
-until the full run's `reports/metrics.json` exists there is no headline to serve. Once it exists,
-`make bundle BUNDLE_ARGS="--metrics reports/metrics.json"` bundles the headline model with its tuned
-parameters. Building reads no label: the bundle is the experiment's own selection, run once.
+`make bundle` runs `tsguard bundle --entity machine-1-1 --metrics reports/metrics.json`: the
+headline model of the committed full run, with its tuned parameters.
+`make bundle BUNDLE_ARGS="--model iforest --default-params"` builds a bundle without a metrics file.
+Building reads no label: the bundle is the experiment's own selection, run once.
 
 `tsguard bundle` selects with `RunConfig()`, the default settings, and that is exactly the run
 configuration of the full profile (seed, three folds, the causality checks on, eight epochs for the
@@ -32,9 +32,10 @@ The container runs `tsguard serve --bundle /models/bundle.joblib --host 0.0.0.0 
 unprivileged user (uid 10001) on a read-only root filesystem. `docker-compose.yml` mounts
 `artifacts/bundle/` read-only at `/models` and publishes the port on `127.0.0.1` only, because the
 service has no authentication; both bundle files must be readable by uid 10001. Run directly,
-`tsguard serve` binds `127.0.0.1:8000` unless `--host` and `--port` say otherwise. The Dockerfile and
-the compose file have been written and parsed but no image has been built from them yet, and the CI
-job that builds one (`container`) has not run.
+`tsguard serve` binds `127.0.0.1:8000` unless `--host` and `--port` say otherwise. The image has been
+built and run on an Apple M2 (Docker Desktop, linux/arm64): it starts healthy in under a minute, runs
+as uid 10001, cannot write its root filesystem, and has neither MLflow nor Optuna installed. The CI
+job that builds it on linux/amd64 (`container`) has not run.
 
 The bundle is loaded and verified before the server listens, so a missing, damaged or stale bundle
 stops the process at start instead of serving errors. The process runs torch on one thread and the
@@ -131,7 +132,7 @@ not sure where a bundle came from:
 
 ```sh
 rm -f artifacts/bundle/bundle.joblib artifacts/bundle/bundle.joblib.sha256
-make bundle BUNDLE_ARGS="--metrics reports/metrics.json"   # or plain `make bundle` before the full run
+make bundle   # the headline model of reports/metrics.json
 ```
 
 It prints the file, the machine, the model and the new digest. Building needs the machine's data in
@@ -161,8 +162,8 @@ same arguments against the container and writes `artifacts/latency-ci.json`, whi
 `tsguard claims --write` puts the `p95_ms` of `reports/latency.json` next to the budget in
 `claims.json` and the README row "p95 HTTP round trip, client-side (ms)". It refuses a
 `latency.json` whose `model` is not the headline model, or that names none: serve the headline
-model (`make bundle BUNDLE_ARGS="--metrics reports/metrics.json"`) and measure again. No
-measurement has been committed yet.
+model (`make bundle`) and measure again. The committed `reports/latency.json` was measured on the
+M2, client and container on the same machine, against the headline bundle for machine-1-1.
 
 If the p95 is over budget:
 
