@@ -34,3 +34,16 @@ updates:
     commit-message:
       prefix: "ci"
       include: "scope"
+
+  # The python base image of the Dockerfile, pinned by digest.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      all:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "build"
+      include: "scope"

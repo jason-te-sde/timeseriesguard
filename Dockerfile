@@ -5,14 +5,15 @@
 # dev group are not installed, so `tsguard serve` must work without them; a unit test keeps
 # tsguard.cli and tsguard.serve free of module-level imports of either.
 #
-# The base images are pinned by tag. Pin each digest the first time the image is pulled
-# (`python:3.11-slim@sha256:...` and `ghcr.io/astral-sh/uv:0.12.19@sha256:...`) and record the
-# digests in the commit message.
+# The base images are pinned by digest: the multi-platform index each tag resolved to on the first
+# build (2026-11-04), so amd64 and arm64 hosts build from the same images. Dependabot's docker
+# ecosystem proposes new python digests; the uv image moves by hand, together with the uv version
+# in .github/workflows/ci.yml.
 
-FROM python:3.11-slim AS builder
+FROM python:3.11-slim@sha256:db20d8506e2f15b6db39b40b6015ca46bae855dec6dd326d462cfe79ae972893 AS builder
 
 # The uv version CI uses (setup-uv in .github/workflows/ci.yml).
-COPY --from=ghcr.io/astral-sh/uv:0.12.19 /uv /bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.12.19@sha256:04d046b13e60d6bcec73cbc5e1cad25d680dea90c8573340950a0ac2d1aef424 /uv /bin/uv
 
 # Copy, never hard-link: the cache mount below is a different filesystem from the venv.
 # Compile the dependencies' bytecode now: the final container's filesystem is read-only, so
@@ -41,7 +42,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     && chmod -R a+rX src
 
 
-FROM python:3.11-slim AS runtime
+FROM python:3.11-slim@sha256:db20d8506e2f15b6db39b40b6015ca46bae855dec6dd326d462cfe79ae972893 AS runtime
 
 # An unprivileged user, with a fixed uid so a bind-mounted directory can be made readable for it.
 RUN groupadd --gid 10001 tsguard \
