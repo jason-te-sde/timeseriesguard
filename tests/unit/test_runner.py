@@ -209,3 +209,36 @@ def test_evaluate_refuses_a_selection_of_another_entity(zscore):
 def test_select_names_the_model_it_does_not_know(world):
     with pytest.raises(ValueError, match="no_such_model"):
         world.runner.select("no_such_model", {})
+
+
+class StubDetector:
+    """A detector that scores a constant, or NaN where ``nan_rows`` says so."""
+
+    name = "stub"
+    input_kind = "features"
+    lookback = 1
+
+    def __init__(self, nan_when_rows: int | None) -> None:
+        self._nan_when_rows = nan_when_rows
+
+    def fit(self, X: np.ndarray) -> None:
+        pass
+
+    def score(self, X: np.ndarray, *, context: int) -> np.ndarray:
+        n = len(X) - context
+        return np.full(n, np.nan if self._nan_when_rows in (None, n) else 0.5)
+
+    def state_digest(self) -> str:
+        return "0" * 64
+
+
+@pytest.mark.parametrize(
+    ("nan_when_rows", "where"), [(None, "validation block of fold 1"), (N_TEST, "test rows")]
+)
+def test_non_finite_scores_name_the_entity_and_model(monkeypatch, nan_when_rows, where):
+    monkeypatch.setattr(
+        "tsguard.experiment.runner.build_detector", lambda *a, **k: StubDetector(nan_when_rows)
+    )
+    runner = build_world(RunConfig(causal_check=False)).runner
+    with pytest.raises(RuntimeError, match=rf"synthetic-0.*'zscore'.*{where}"):
+        runner.select("zscore", ZSCORE)
