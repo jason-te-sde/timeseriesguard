@@ -2,26 +2,36 @@
 
 ``reproduce`` writes a `Metrics` object; ``claims.json`` and the README block are computed from
 it and from nothing else, so a number that appears in the README can always be traced to a field
-here. Every model forbids unknown fields and is frozen: a typo in a field name fails at
-validation, and a result cannot be edited after it is built.
+here. Every model forbids unknown fields, so a typo in a field name fails at validation, and
+every float must be finite, so a NaN fails there too instead of corrupting a comparison later.
+`Metrics` also checks that the headline agrees with the model table it was taken from. The models
+are frozen, which blocks attribute assignment only: the dicts and lists inside stay mutable, so
+treat a built `Metrics` as read-only.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal, Self
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 PERCENTILES = (2.5, 97.5)
 """The percentiles that bound a 95 % bootstrap interval."""
 
+FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
+"""A float that validation refuses to take as NaN or infinite."""
+
+HEADLINE_AUC_TOLERANCE = 1e-9
+"""How far ``headline.auc_pr`` may sit from the model table's value before they disagree."""
+
 
 class _Strict(BaseModel):
-    """Base of every metrics model: unknown fields are errors and instances are frozen."""
+    """Base of every metrics model: unknown fields are errors and attributes cannot be set."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -35,9 +45,9 @@ class ProtocolScoreModel(_Strict):
         f1_oracle: The best F1 any threshold could reach (an upper bound, not a result).
     """
 
-    auc_pr: float
-    f1: float
-    f1_oracle: float
+    auc_pr: FiniteFloat
+    f1: FiniteFloat
+    f1_oracle: FiniteFloat
 
 
 class EntityResultModel(_Strict):
@@ -53,10 +63,10 @@ class EntityResultModel(_Strict):
     """
 
     entity: str
-    validation_objective: float
-    threshold: float
+    validation_objective: FiniteFloat
+    threshold: FiniteFloat
     protocols: dict[str, ProtocolScoreModel]
-    sensitivity: dict[str, float]
+    sensitivity: dict[str, FiniteFloat]
     digests: dict[str, str]
 
 
@@ -71,10 +81,10 @@ class ModelSummaryModel(_Strict):
         per_entity: The per-entity results, in entity order.
     """
 
-    params: dict[str, int | float | str]
-    validation_objective: float
+    params: dict[str, int | FiniteFloat | str]
+    validation_objective: FiniteFloat
     macro: dict[str, ProtocolScoreModel]
-    sensitivity_macro: dict[str, float]
+    sensitivity_macro: dict[str, FiniteFloat]
     per_entity: list[EntityResultModel]
 
 
@@ -92,8 +102,8 @@ class HeadlineModel(_Strict):
 
     model: str
     protocol: Literal["event_level"]
-    auc_pr: float
-    ci95: tuple[float, float]
+    auc_pr: FiniteFloat
+    ci95: tuple[FiniteFloat, FiniteFloat]
     selected_by: Literal["validation_objective"]
     label_reads_at_selection: int
 
@@ -121,16 +131,16 @@ class AblationModel(_Strict):
 
     model: str
     seeds: list[int]
-    f1_with: list[float]
-    f1_without: list[float]
-    auc_pr_with: list[float]
-    auc_pr_without: list[float]
-    delta_f1_points_mean: float
-    delta_f1_points_std: float
-    delta_f1_relative_mean: float
-    delta_f1_relative_std: float
-    delta_auc_pr_mean: float
-    delta_auc_pr_std: float
+    f1_with: list[FiniteFloat]
+    f1_without: list[FiniteFloat]
+    auc_pr_with: list[FiniteFloat]
+    auc_pr_without: list[FiniteFloat]
+    delta_f1_points_mean: FiniteFloat
+    delta_f1_points_std: FiniteFloat
+    delta_f1_relative_mean: FiniteFloat
+    delta_f1_relative_std: FiniteFloat
+    delta_auc_pr_mean: FiniteFloat
+    delta_auc_pr_std: FiniteFloat
 
 
 class TuningModel(_Strict):
@@ -170,6 +180,10 @@ class DatasetModel(_Strict):
 class Metrics(_Strict):
     """Everything a ``reproduce`` run measured: the content of ``metrics.json``.
 
+    Besides the per-field checks, validation requires ``models`` to be non-empty, the headline
+    model to be one of them, and the headline AUC-PR to equal that model's macro score under
+    the headline protocol, so a file that contradicts itself is invalid, not merely odd.
+
     Attributes:
         schema_version: Version of this schema; bumped when a field changes meaning.
         profile: Name of the profile that produced the run (``full`` or ``smoke``).
@@ -178,7 +192,8 @@ class Metrics(_Strict):
         protocol: The protocol constants (chunk, cooldown, K), by name.
         feature_specs: Number of registered feature specs.
         models: Per-detector results, by detector name.
-        headline: The reported number.
+        headline: The reported number; validation requires it to equal the headline model's
+            macro score under the headline protocol.
         ablation: FFT ablation results, by detector name.
         tuning: The hyperparameter search.
         environment: Machine- and time-dependent facts (versions, commit, timestamp). The only
@@ -196,6 +211,32 @@ class Metrics(_Strict):
     ablation: dict[str, AblationModel]
     tuning: TuningModel
     environment: dict[str, str]
+
+    @model_validator(mode="after")
+    def _headline_agrees_with_models(self) -> Self:
+        """Require the headline to be the number the model table already holds.
+
+        Raises:
+            ValueError: ``models`` is empty; the headline model is not in ``models``; it has no
+                macro score for the headline protocol; or the headline AUC-PR is not that score.
+        """
+        if not self.models:
+            raise ValueError("models must not be empty")
+        name, protocol = self.headline.model, self.headline.protocol
+        if name not in self.models:
+            raise ValueError(f"headline.model {name!r} is not in models ({sorted(self.models)})")
+        macro = self.models[name].macro
+        if protocol not in macro:
+            raise ValueError(
+                f"models[{name!r}] has no macro score for headline.protocol {protocol!r}"
+            )
+        table_value = macro[protocol].auc_pr
+        if not math.isclose(self.headline.auc_pr, table_value, abs_tol=HEADLINE_AUC_TOLERANCE):
+            raise ValueError(
+                f"headline.auc_pr {self.headline.auc_pr!r} differs from "
+                f"models[{name!r}].macro[{protocol!r}].auc_pr {table_value!r}"
+            )
+        return self
 
 
 def write_metrics(path: Path, metrics: Metrics) -> None:

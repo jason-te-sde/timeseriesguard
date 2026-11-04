@@ -17,6 +17,7 @@ import re
 from collections.abc import Collection
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Final
 
 from tsguard.eval.protocols import PROTOCOLS
@@ -38,11 +39,13 @@ _MODEL_ORDER: Final = ("zscore", "iforest", "cnn_ae", "lstm_ae")
 _REPORTS: Final = "reports"
 _RUN_ID_COLUMN: Final = "run_id"
 _STALE_README: Final = "README block differs from metrics.json; run `tsguard claims --write`"
-_SOURCE_OF: Final = {
-    "mlflow_runs": "mlflow_runs.csv",
-    "p95_ms": "latency.json",
-    "p95_budget_ms": "P95_BUDGET_MS",
-}
+_SOURCE_OF: Final = MappingProxyType(
+    {
+        "mlflow_runs": "mlflow_runs.csv",
+        "p95_ms": "latency.json",
+        "p95_budget_ms": "P95_BUDGET_MS",
+    }
+)
 _BEGIN_LINE: Final = re.compile(rf"^{re.escape(BEGIN)}(?=[ \t]*$)", re.MULTILINE)
 _END_LINE: Final = re.compile(rf"^{re.escape(END)}(?=[ \t]*$)", re.MULTILINE)
 

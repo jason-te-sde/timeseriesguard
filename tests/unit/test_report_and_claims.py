@@ -4,11 +4,15 @@ import csv
 import json
 import math
 from pathlib import Path
+from typing import Any
 
+import numpy as np
 import pytest
 from pydantic import ValidationError
 
 from tsguard.eval.protocols import PROTOCOLS
+from tsguard.repro import claims as claims_module
+from tsguard.repro import report as report_module
 from tsguard.repro.claims import (
     BEGIN,
     END,
@@ -41,6 +45,7 @@ MACRO_AUC_PR = {
     "iforest": (0.1876, 0.7011, 0.3302, 0.5538),
 }
 HEADLINE = "cnn_ae"
+STALE_README = "README block differs from metrics.json; run `tsguard claims --write`"
 README_TEXT = f"# Demo\n\nIntro.\n\n{BEGIN}\n{END}\n\n## After\n\nFooter.\n"
 CSV_HEADER = ["run_id", "experiment", "run_name", "kind", "model", "objective", "params_json"]
 
@@ -514,3 +519,190 @@ def test_missing_mlflow_csv_is_a_message_not_an_exception(repo):
     messages = check_claims(repo)
     assert len(messages) == 1
     assert "mlflow_runs.csv: not found" in messages[0]
+
+
+def _raw() -> dict[str, Any]:
+    return tiny_metrics().model_dump(mode="json")
+
+
+def _headline_auc_disagrees(raw: dict[str, Any]) -> None:
+    raw["headline"]["auc_pr"] = 0.90
+
+
+def _no_models(raw: dict[str, Any]) -> None:
+    raw["models"] = {}
+
+
+def _headline_model_unknown(raw: dict[str, Any]) -> None:
+    raw["headline"]["model"] = "ghost"
+
+
+def _headline_protocol_missing(raw: dict[str, Any]) -> None:
+    del raw["models"][HEADLINE]["macro"]["event_level"]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        pytest.param(
+            _headline_auc_disagrees,
+            "headline.auc_pr 0.9 differs from models['cnn_ae'].macro['event_level'].auc_pr 0.8234",
+            id="headline-auc-pr-disagrees",
+        ),
+        pytest.param(_no_models, "models must not be empty", id="no-models"),
+        pytest.param(
+            _headline_model_unknown, "headline.model 'ghost' is not in models", id="unknown-model"
+        ),
+        pytest.param(
+            _headline_protocol_missing,
+            "models['cnn_ae'] has no macro score for headline.protocol 'event_level'",
+            id="headline-protocol-missing",
+        ),
+    ],
+)
+def test_contradictory_metrics_are_rejected(mutate, message):
+    raw = _raw()
+    mutate(raw)
+    with pytest.raises(ValidationError) as excinfo:
+        Metrics.model_validate(raw)
+    assert message in str(excinfo.value)
+
+
+def test_headline_auc_pr_must_match_to_a_tight_tolerance():
+    raw = _raw()
+    raw["headline"]["auc_pr"] += 1e-12
+    Metrics.model_validate(raw)  # float noise is fine
+    raw["headline"]["auc_pr"] += 1e-6
+    with pytest.raises(ValidationError, match=r"headline\.auc_pr"):
+        Metrics.model_validate(raw)
+
+
+def test_check_claims_reports_a_self_contradictory_metrics_file_as_invalid(repo):
+    raw = _raw()
+    _headline_auc_disagrees(raw)
+    (repo / "reports" / "metrics.json").write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match=r"headline\.auc_pr"):
+        read_metrics(repo / "reports" / "metrics.json")
+    messages = check_claims(repo)
+    assert len(messages) == 1
+    assert messages[0].startswith("reports/metrics.json: invalid")
+    assert "headline.auc_pr" in messages[0]
+
+
+def _nan_threshold(raw: dict[str, Any], bad: float) -> None:
+    raw["models"]["zscore"]["per_entity"][0]["threshold"] = bad
+
+
+def _nan_in_a_list(raw: dict[str, Any], bad: float) -> None:
+    raw["ablation"]["zscore"]["f1_with"][0] = bad
+
+
+def _nan_in_the_interval(raw: dict[str, Any], bad: float) -> None:
+    raw["headline"]["ci95"][1] = bad
+
+
+def _nan_in_params(raw: dict[str, Any], bad: float) -> None:
+    raw["models"]["zscore"]["params"]["learning_rate"] = bad
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf], ids=["nan", "inf", "-inf"])
+@pytest.mark.parametrize(
+    "put",
+    [_nan_threshold, _nan_in_a_list, _nan_in_the_interval, _nan_in_params],
+    ids=["float-field", "list-item", "tuple-item", "params-union"],
+)
+def test_non_finite_numbers_fail_validation_with_a_clear_message(put, bad):
+    raw = _raw()
+    put(raw, bad)
+    with pytest.raises(ValidationError, match="finite number"):
+        Metrics.model_validate(raw)
+
+
+def test_a_nan_in_metrics_json_is_reported_as_invalid(repo):
+    raw = _raw()
+    _nan_threshold(raw, math.nan)
+    (repo / "reports" / "metrics.json").write_text(json.dumps(raw))  # json writes the token NaN
+    messages = check_claims(repo)
+    assert len(messages) == 1
+    assert "metrics.json: invalid" in messages[0]
+    assert "finite number" in messages[0]
+
+
+def test_bootstrap_ci_of_two_points_is_hand_checkable():
+    # The mean of a resample of [0, 1] is 0, 0.5 or 1 with probability 1/4, 1/2, 1/4, so the
+    # 2.5th percentile of 1000 resampled means is 0 and the 97.5th is 1.
+    assert bootstrap_ci([0.0, 1.0], seed=0) == (0.0, 1.0)
+
+
+def test_bootstrap_ci_is_the_2_5_and_97_5_percentile_of_1000_resampled_means():
+    values = [1.0, 2.0, 4.0]
+    picks = np.random.default_rng(5).integers(0, len(values), size=(1000, len(values)))
+    means = np.sort(np.asarray(values)[picks].mean(axis=1))
+
+    def at(percent: float) -> float:  # linear interpolation between order statistics, written out
+        rank = percent / 100 * (len(means) - 1)
+        below = int(rank)
+        return float(means[below] + (rank - below) * (means[below + 1] - means[below]))
+
+    assert bootstrap_ci(values, seed=5, n=1000) == pytest.approx((at(2.5), at(97.5)), rel=1e-12)
+    assert bootstrap_ci(values, seed=5) == bootstrap_ci(values, seed=5, n=1000)
+
+
+def _stale_metrics(root):
+    raw = json.loads((root / "reports" / "metrics.json").read_text())
+    raw["headline"]["auc_pr"] = raw["models"][HEADLINE]["macro"]["event_level"]["auc_pr"] = 0.9123
+    write_metrics(root / "reports" / "metrics.json", Metrics.model_validate(raw))
+
+
+def _stale_latency(root):
+    (root / "reports" / "latency.json").write_text(json.dumps({"p95_ms": 45.67}))
+
+
+def _removed_latency(root):
+    (root / "reports" / "latency.json").unlink()
+
+
+def _more_runs(root):
+    write_runs_csv(root / "reports" / "mlflow_runs.csv", 33)
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        pytest.param(
+            _stale_metrics,
+            ["claims.json: headline_auc_pr is 0.82, metrics.json gives 0.91", STALE_README],
+            id="metrics-json",
+        ),
+        pytest.param(
+            _stale_latency,
+            ["claims.json: p95_ms is 12.30, latency.json gives 45.67", STALE_README],
+            id="latency-json",
+        ),
+        pytest.param(
+            _removed_latency,
+            ["claims.json: p95_ms is 12.30, latency.json gives null", STALE_README],
+            id="latency-json-removed",
+        ),
+        pytest.param(
+            _more_runs,
+            ["claims.json: mlflow_runs is 32, mlflow_runs.csv gives 33", STALE_README],
+            id="mlflow-runs-csv",
+        ),
+    ],
+)
+def test_a_source_changed_after_write_claims_is_reported(repo, change, expected):
+    write_claims(repo)
+    assert check_claims(repo) == []
+    change(repo)
+    assert check_claims(repo) == expected
+
+
+@pytest.mark.parametrize("module", [report_module, claims_module], ids=["report", "claims"])
+def test_modules_hold_no_mutable_global_state(module):
+    mutable = [
+        name
+        for name, value in vars(module).items()
+        if not name.startswith("__") and isinstance(value, dict | list | set)
+    ]
+    assert mutable == []
