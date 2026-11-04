@@ -15,6 +15,7 @@ the default body echoes it, and an echoed NaN cannot be written as JSON, which w
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request
@@ -23,7 +24,19 @@ from fastapi.responses import JSONResponse
 
 from tsguard.errors import GUARD_FIT_END, LeakageError
 from tsguard.serve.bundle import HistoryTooShortError, load_bundle, score_rows
-from tsguard.serve.schemas import ModelInfo, ScoreRequest, ScoreResponse
+from tsguard.serve.schemas import (
+    EntityMismatch,
+    EntityMismatchBody,
+    FieldError,
+    FitRange,
+    FitRangeBody,
+    ModelInfo,
+    SchemaErrorBody,
+    ScoreRequest,
+    ScoreResponse,
+    ShortHistory,
+    ShortHistoryBody,
+)
 
 
 def create_app(bundle_path: Path) -> FastAPI:
@@ -53,15 +66,28 @@ def create_app(bundle_path: Path) -> FastAPI:
         source_commit=bundle.source_commit,
     )
     app = FastAPI(title="tsguard", summary=f"Anomaly scores for {bundle.entity}")
+    score_responses: dict[int | str, dict[str, Any]] = {
+        404: {
+            "model": EntityMismatchBody,
+            "description": "The rows are of a machine this service does not serve.",
+        },
+        422: {
+            "model": ShortHistoryBody | FitRangeBody | SchemaErrorBody,
+            "description": (
+                "The history is too short, its last row is inside the rows the scaling was "
+                "fitted on, or the request is not a valid score request."
+            ),
+        },
+    }
 
     @app.exception_handler(RequestValidationError)
     def invalid_request(request: Request, error: RequestValidationError) -> JSONResponse:
         """Report each schema violation as ``type``, ``loc`` and ``msg``, never the input."""
         detail = [
-            {"type": item["type"], "loc": list(item["loc"]), "msg": item["msg"]}
+            FieldError(type=item["type"], loc=list(item["loc"]), msg=item["msg"])
             for item in error.errors()
         ]
-        return JSONResponse(status_code=422, content={"detail": detail})
+        return JSONResponse(status_code=422, content=SchemaErrorBody(detail=detail).model_dump())
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -73,16 +99,16 @@ def create_app(bundle_path: Path) -> FastAPI:
         """Describe the served model."""
         return info
 
-    @app.post("/v1/score")
+    @app.post("/v1/score", responses=score_responses)
     def score(request: ScoreRequest) -> ScoreResponse:
         """Score the last row of the history."""
         if request.entity != bundle.entity:
             raise HTTPException(
                 status_code=404,
-                detail={
-                    "message": f"this service serves {bundle.entity!r}, not {request.entity!r}",
-                    "served_entity": bundle.entity,
-                },
+                detail=EntityMismatch(
+                    message=f"this service serves {bundle.entity!r}, not {request.entity!r}",
+                    served_entity=bundle.entity,
+                ).model_dump(),
             )
         try:
             value = score_rows(
@@ -93,18 +119,18 @@ def create_app(bundle_path: Path) -> FastAPI:
         except HistoryTooShortError as error:
             raise HTTPException(
                 status_code=422,
-                detail={
-                    "message": str(error),
-                    "required_rows": error.required_rows,
-                    "received_rows": error.received_rows,
-                },
+                detail=ShortHistory(
+                    message=str(error),
+                    required_rows=error.required_rows,
+                    received_rows=error.received_rows,
+                ).model_dump(),
             ) from None
         except LeakageError as error:
             if error.guard != GUARD_FIT_END:
                 raise
             raise HTTPException(
                 status_code=422,
-                detail={"message": str(error), "fit_end": bundle.fit_end},
+                detail=FitRange(message=str(error), fit_end=bundle.fit_end).model_dump(),
             ) from None
         return ScoreResponse(
             entity=bundle.entity,

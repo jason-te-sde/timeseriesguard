@@ -1,9 +1,12 @@
 """The request and response bodies of the scoring service.
 
-Every model forbids unknown fields and refuses NaN and infinity. Python's JSON parser accepts the
-tokens ``NaN`` and ``Infinity``, so a request body that carries one reaches validation as a
-float; validation is the only place it can be refused, and it is refused with a 422 before any
-model sees it.
+Every model is strict (a bool or a string is not a number), forbids unknown fields, and refuses
+NaN and infinity. Python's JSON parser accepts the tokens ``NaN`` and ``Infinity``, so a request
+body that carries one reaches validation as a float; validation is the only place it can be
+refused, and it is refused with a 422 before any model sees it.
+
+The error bodies the routes return are models too, so the OpenAPI document declares them and the
+tests parse every refusal with the model that describes it.
 """
 
 from __future__ import annotations
@@ -23,13 +26,28 @@ stay finite. Beyond about 1e77 they overflow to NaN, which the pipeline refuses,
 otherwise reach the client as a 500.
 """
 
-_STRICT = ConfigDict(extra="forbid", allow_inf_nan=False)
+MAX_HISTORY_ROWS: Final = 10_000
+"""Most rows a request may carry. A model needs at most 64, so this bounds only the parsing."""
+
+MAX_FIRST_INDEX: Final = 2**53 - MAX_HISTORY_ROWS
+"""Largest ``first_index``: with `MAX_HISTORY_ROWS` rows, every row index stays below 2**53.
+
+The calendar features turn the row index into a float64, which holds integers exactly only up to
+2**53; beyond about 1e308 the conversion raises OverflowError. At this bound the last row of the
+longest request is 2**53 - 1, and each index is still an exact float.
+"""
 
 ChannelValue = Annotated[float, Field(ge=-MAX_ABS_VALUE, le=MAX_ABS_VALUE)]
 """One channel value of one row: finite and within `MAX_ABS_VALUE`."""
 
 
-class ScoreRequest(BaseModel):
+class _Strict(BaseModel):
+    """Base of every body: no coercion, no unknown fields, no NaN or infinity."""
+
+    model_config = ConfigDict(strict=True, extra="forbid", allow_inf_nan=False)
+
+
+class ScoreRequest(_Strict):
     """The rows a client wants one anomaly score for.
 
     The score is for the last row of ``history``. Rows are the raw channel values, in time order,
@@ -38,17 +56,15 @@ class ScoreRequest(BaseModel):
     Attributes:
         entity: Name of the machine the rows come from; must be the machine the service serves.
         first_index: Absolute row index (in the machine's full series, train rows first) of
-            ``history[0]``.
-        history: Rows of ``N_CHANNELS`` values each, every value within ``MAX_ABS_VALUE``; at
-            least as many rows as the model needs, which ``GET /v1/model`` reports as
-            ``required_rows``.
+            ``history[0]``, from 0 to `MAX_FIRST_INDEX`.
+        history: Between 1 and `MAX_HISTORY_ROWS` rows of ``N_CHANNELS`` values each, every
+            value within `MAX_ABS_VALUE`; at least as many rows as the model needs, which
+            ``GET /v1/model`` reports as ``required_rows``.
     """
 
-    model_config = _STRICT
-
     entity: str
-    first_index: int = Field(ge=0)
-    history: list[list[ChannelValue]] = Field(min_length=1)
+    first_index: int = Field(ge=0, le=MAX_FIRST_INDEX)
+    history: list[list[ChannelValue]] = Field(min_length=1, max_length=MAX_HISTORY_ROWS)
 
     @model_validator(mode="after")
     def _rows_have_one_value_per_channel(self) -> Self:
@@ -63,7 +79,7 @@ class ScoreRequest(BaseModel):
         return self
 
 
-class ScoreResponse(BaseModel):
+class ScoreResponse(_Strict):
     """The score of one row.
 
     Attributes:
@@ -77,8 +93,6 @@ class ScoreResponse(BaseModel):
         bundle_sha256: Digest of the bundle file that produced the score.
     """
 
-    model_config = _STRICT
-
     entity: str
     model: str
     row_index: int
@@ -88,7 +102,7 @@ class ScoreResponse(BaseModel):
     bundle_sha256: str
 
 
-class ModelInfo(BaseModel):
+class ModelInfo(_Strict):
     """What the service serves.
 
     Attributes:
@@ -104,8 +118,6 @@ class ModelInfo(BaseModel):
         source_commit: The dataset commit the bundle was fitted on.
     """
 
-    model_config = _STRICT
-
     entity: str
     model: str
     params: dict[str, int | float | str]
@@ -115,3 +127,95 @@ class ModelInfo(BaseModel):
     feature_columns: int
     bundle_sha256: str
     source_commit: str
+
+
+class EntityMismatch(_Strict):
+    """Why a request for another machine was refused (404).
+
+    Attributes:
+        message: What was asked for and what is served.
+        served_entity: The machine to ask about instead.
+    """
+
+    message: str
+    served_entity: str
+
+
+class ShortHistory(_Strict):
+    """Why a history with too few rows was refused (422).
+
+    Attributes:
+        message: What the model needs.
+        required_rows: Rows to send at least.
+        received_rows: Rows that were sent.
+    """
+
+    message: str
+    required_rows: int
+    received_rows: int
+
+
+class FitRange(_Strict):
+    """Why a row inside the rows the scaling was fitted on was refused (422).
+
+    Attributes:
+        message: Which row was asked for and where the fit ended.
+        fit_end: The first row that can be scored.
+    """
+
+    message: str
+    fit_end: int
+
+
+class FieldError(_Strict):
+    """One schema violation, in the shape FastAPI reports it, without the rejected input.
+
+    Attributes:
+        type: Pydantic's error type, such as ``missing`` or ``extra_forbidden``.
+        loc: Where the error is: ``body`` and then the path of keys and indexes.
+        msg: What is wrong.
+    """
+
+    type: str
+    loc: list[str | int]
+    msg: str
+
+
+class EntityMismatchBody(_Strict):
+    """The 404 response: ``{"detail": EntityMismatch}``.
+
+    Attributes:
+        detail: Why the request was refused.
+    """
+
+    detail: EntityMismatch
+
+
+class ShortHistoryBody(_Strict):
+    """A 422 response: ``{"detail": ShortHistory}``.
+
+    Attributes:
+        detail: Why the request was refused.
+    """
+
+    detail: ShortHistory
+
+
+class FitRangeBody(_Strict):
+    """A 422 response: ``{"detail": FitRange}``.
+
+    Attributes:
+        detail: Why the request was refused.
+    """
+
+    detail: FitRange
+
+
+class SchemaErrorBody(_Strict):
+    """A 422 response for a request that is not a valid `ScoreRequest`.
+
+    Attributes:
+        detail: One entry per violation.
+    """
+
+    detail: list[FieldError]

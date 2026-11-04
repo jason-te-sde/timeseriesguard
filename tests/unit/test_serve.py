@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import joblib
 import numpy as np
 import pytest
 import torch
@@ -28,6 +29,7 @@ from tsguard.models.iforest import IsolationForestDetector
 from tsguard.models.space import DEFAULT_PARAMS
 from tsguard.repro.report import write_metrics
 from tsguard.repro.seeding import configure_runtime
+from tsguard.serve import bundle as bundle_module
 from tsguard.serve import commands
 from tsguard.serve.app import create_app
 from tsguard.serve.bundle import (
@@ -39,7 +41,16 @@ from tsguard.serve.bundle import (
     save_bundle,
     score_rows,
 )
-from tsguard.serve.schemas import ScoreRequest, ScoreResponse
+from tsguard.serve.schemas import (
+    MAX_FIRST_INDEX,
+    MAX_HISTORY_ROWS,
+    EntityMismatchBody,
+    FitRangeBody,
+    SchemaErrorBody,
+    ScoreRequest,
+    ScoreResponse,
+    ShortHistoryBody,
+)
 
 N_TRAIN = 3000
 N_TEST = 2000
@@ -245,6 +256,46 @@ def test_largest_accepted_magnitude_scores_without_error(which, served, entity):
     assert np.isfinite(response.json()["score"])
 
 
+@pytest.mark.parametrize("first_index", [MAX_FIRST_INDEX + 1, 2**53 + 1, 10**308, 10**400])
+def test_first_index_beyond_the_exact_float_range_is_422(first_index, iforest, entity):
+    # The calendar features turn the row index into a float64; 1e308 overflowed it and was a 500.
+    body = _request(entity, N_TRAIN + 50, 64)
+    body["first_index"] = first_index
+    response = iforest.client.post("/v1/score", json=body)
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"][0]["loc"] == ["body", "first_index"]
+
+
+def test_the_largest_first_index_and_the_longest_history_end_on_an_exact_row(iforest, rng):
+    # Every row index of such a request is an integer below 2**53, which float64 holds exactly.
+    history = rng.random((MAX_HISTORY_ROWS, N_CHANNELS)).tolist()
+    body = {"entity": "synthetic-0", "first_index": MAX_FIRST_INDEX, "history": history}
+    response = iforest.client.post("/v1/score", json=body)
+    assert response.status_code == 200, response.text
+    assert response.json()["row_index"] == MAX_FIRST_INDEX + MAX_HISTORY_ROWS - 1 == 2**53 - 1
+
+
+def test_history_beyond_the_row_limit_is_422(iforest):
+    history = [[0.5] * N_CHANNELS] * (MAX_HISTORY_ROWS + 1)
+    body = {"entity": "synthetic-0", "first_index": LAST_FIT_END, "history": history}
+    response = iforest.client.post("/v1/score", json=body)
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "history"]
+    assert len(response.text) < 500
+
+
+@pytest.mark.parametrize("which", MODELS)
+@pytest.mark.parametrize("exponent", [-100, -160])
+def test_a_history_of_tiny_magnitudes_scores(which, exponent, served, rng):
+    # Squaring the second moment of such a window underflows, which made the kurtosis 0/0.
+    s = served[which]
+    history = (10.0**exponent * rng.standard_normal((REQUIRED_ROWS[which], N_CHANNELS))).tolist()
+    body = {"entity": "synthetic-0", "first_index": LAST_FIT_END, "history": history}
+    response = s.client.post("/v1/score", json=body)
+    assert response.status_code == 200, response.text
+    assert np.isfinite(response.json()["score"])
+
+
 def test_row_inside_training_range_is_422(iforest, entity):
     assert iforest.bundle.fit_end == LAST_FIT_END
     r = LAST_FIT_END - 1
@@ -286,12 +337,66 @@ def test_unknown_entity_is_404(iforest, entity):
         pytest.param(lambda b: b.update(extra=1), id="unknown_field"),
         pytest.param(lambda b: b.pop("entity"), id="missing_entity"),
         pytest.param(lambda b: b.update(first_index="x"), id="non_integer_first_index"),
+        pytest.param(lambda b: b.update(first_index=True), id="bool_first_index"),
+        pytest.param(lambda b: b.update(first_index="3100"), id="numeric_string_first_index"),
+        pytest.param(lambda b: b.update(first_index=3100.0), id="integral_float_first_index"),
+        pytest.param(lambda b: b.update(entity=5), id="entity_not_a_string"),
+        pytest.param(lambda b: b["history"][2].__setitem__(4, True), id="bool_value"),
+        pytest.param(lambda b: b["history"][2].__setitem__(4, "0.5"), id="numeric_string_value"),
+        pytest.param(lambda b: b.update(history=b["history"][0]), id="history_not_nested"),
     ],
 )
 def test_schema_violations_are_422(mutate, iforest, entity):
     body = _request(entity, N_TRAIN + 50, 64)
     mutate(body)
     assert iforest.client.post("/v1/score", json=body).status_code == 422
+
+
+@pytest.mark.parametrize(
+    "content",
+    [b"{not json", b"", b"[]", b'"text"', b"42", b"null", b'{"entity": "synthetic-0"}'],
+    ids=["invalid_json", "empty", "list", "string", "number", "null", "missing_fields"],
+)
+def test_a_body_that_is_not_a_score_request_is_422(content, iforest):
+    response = iforest.client.post(
+        "/v1/score", content=content, headers={"content-type": "application/json"}
+    )
+    assert response.status_code == 422
+    body = SchemaErrorBody.model_validate(response.json())
+    assert body.detail, "a 422 must say what was wrong"
+
+
+def test_error_bodies_match_the_models_the_routes_declare(iforest, entity):
+    post = iforest.client.post
+    short = post("/v1/score", json=_request(entity, N_TRAIN + 50, 10))
+    inside = post("/v1/score", json=_request(entity, LAST_FIT_END - 1, 64))
+    wrong = post("/v1/score", json={**_request(entity, N_TRAIN + 50, 64), "entity": "machine-9-9"})
+    schema = post("/v1/score", json={**_request(entity, N_TRAIN + 50, 64), "extra": 1})
+    assert ShortHistoryBody.model_validate(short.json()).detail.received_rows == 10
+    assert FitRangeBody.model_validate(inside.json()).detail.fit_end == LAST_FIT_END
+    assert EntityMismatchBody.model_validate(wrong.json()).detail.served_entity == entity.name
+    assert SchemaErrorBody.model_validate(schema.json()).detail[0].type == "extra_forbidden"
+
+
+def test_openapi_declares_the_custom_error_bodies(iforest):
+    doc = iforest.client.get("/openapi.json").json()
+    responses = doc["paths"]["/v1/score"]["post"]["responses"]
+    assert {"200", "404", "422"} <= set(responses)
+
+    def ref(schema: dict[str, Any]) -> str:
+        return str(schema["$ref"]).rsplit("/", 1)[-1]
+
+    assert ref(responses["404"]["content"]["application/json"]["schema"]) == "EntityMismatchBody"
+    union = responses["422"]["content"]["application/json"]["schema"]["anyOf"]
+    assert sorted(ref(member) for member in union) == [
+        "FitRangeBody",
+        "SchemaErrorBody",
+        "ShortHistoryBody",
+    ]
+    assert "required_rows" in doc["components"]["schemas"]["ShortHistory"]["properties"]
+    assert doc["components"]["schemas"]["ScoreRequest"]["properties"]["history"]["maxItems"] == (
+        MAX_HISTORY_ROWS
+    )
 
 
 @pytest.mark.parametrize("which", MODELS)
@@ -356,6 +461,39 @@ def test_malformed_sidecar_is_refused(text, iforest, tmp_path):
         load_bundle(path)
 
 
+def _shifted(spec: Any, factor: float = 1.0, shift: float = 0.0) -> Any:
+    inner = spec.fn
+    return dataclasses.replace(spec, fn=lambda x, cache: inner(x, cache) * factor + shift)
+
+
+@pytest.mark.parametrize(
+    ("which", "registry"), [("iforest", "FEATURE_SPECS"), ("cnn_ae", "RAW_SPECS")]
+)
+def test_a_bundle_is_refused_once_the_feature_code_computes_other_values(
+    which, registry, served, monkeypatch
+):
+    original = getattr(bundle_module, registry)
+    changed = (_shifted(original[0], shift=1e-3), *original[1:])
+    monkeypatch.setattr(bundle_module, registry, changed)
+    with pytest.raises(ChecksumError, match="feature code") as caught:
+        load_bundle(served[which].path)
+    assert original[0].name in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("which", "registry"), [("iforest", "FEATURE_SPECS"), ("cnn_ae", "RAW_SPECS")]
+)
+def test_rounding_noise_in_the_features_is_not_a_change_of_code(
+    which, registry, served, monkeypatch
+):
+    # A bundle built on one machine is served on another, where libm may differ in the last bit.
+    original = getattr(bundle_module, registry)
+    noisy = tuple(_shifted(spec, factor=1.0 + 1e-13) for spec in original)
+    monkeypatch.setattr(bundle_module, registry, noisy)
+    bundle, _ = load_bundle(served[which].path)
+    assert bundle.model == which
+
+
 class _Marker:
     """A pickle payload that leaves a file behind when it is unpickled."""
 
@@ -370,8 +508,6 @@ def test_checksum_is_verified_before_unpickling(tmp_path):
     marker = tmp_path / "unpickled"
     path = tmp_path / "evil.joblib"
     sidecar = Path(str(path) + ".sha256")
-    import joblib
-
     joblib.dump(_Marker(marker), path)
     sidecar.write_text("0" * 64 + "\n")
     with pytest.raises(ChecksumError):

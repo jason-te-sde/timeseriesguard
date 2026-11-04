@@ -5,9 +5,16 @@ fitted feature pipeline, the fitted detector and the frozen threshold, for one e
 else travels with it: not the training rows, and not a label (selection reads none).
 
 The file is a joblib pickle of a plain dict, not of `Bundle`, because a fitted `FeaturePipeline`
-cannot be pickled: its feature specs are closures. The dict holds the pipeline's fitted
-statistics and which spec registry it was built from, and `load_bundle` rebuilds the pipeline
-from that registry, then checks the rebuilt state against the digest recorded at save time.
+cannot be pickled: its feature specs are closures. The dict holds `FeaturePipeline.get_state` and
+which spec registry the pipeline was built from; `load_bundle` rebuilds the pipeline from that
+registry with `FeaturePipeline.from_state`, which checks the state against its own digest.
+
+Two more checks keep a bundle from being served by code that is not the code that built it. The
+detector's state digest is recorded and re-checked. And the unscaled features of a fixed
+synthetic window are recorded, and recomputed at load: if they differ, a feature function changed
+after the bundle was built, and the scaling fitted for the old function would be applied to the
+new one. The comparison is by tolerance and not by hash because a bundle built on one machine is
+served on another, where the last bit of a libm result may differ.
 
 The sha256 sidecar (``<bundle>.sha256``) detects a damaged or swapped file before anything is
 unpickled. It is not a signature: whoever can write the bundle can write its sidecar, and
@@ -26,18 +33,31 @@ from typing import Any, Final
 import joblib
 import numpy as np
 
+from tsguard.data.contract import N_CHANNELS
 from tsguard.data.labels import LabelAudit
 from tsguard.data.smd import SMD_COMMIT, EntityData
 from tsguard.errors import ChecksumError, ContractError, TsguardError
 from tsguard.experiment.runner import EntityRunner, RunConfig, Selection
-from tsguard.features.pipeline import RAW_SPECS, FeaturePipeline
+from tsguard.features.pipeline import RAW_SPECS, FeaturePipeline, compute_raw_features
 from tsguard.features.specs import FEATURE_SPECS, FeatureSpec
 from tsguard.models import Params
 from tsguard.models.base import Detector, InputKind
 from tsguard.models.iforest import IsolationForestDetector
 
-FORMAT_VERSION: Final = 1
+FORMAT_VERSION: Final = 2
 """Version of the dict that `save_bundle` pickles; bumped when a key changes meaning."""
+
+GOLDEN_ROWS: Final = 4
+"""Rows of the fixed window whose features are recorded in a bundle."""
+
+GOLDEN_RTOL: Final = 1e-6
+GOLDEN_ATOL: Final = 1e-9
+"""How far recomputed features may sit from the recorded ones before the code is called changed.
+
+Platform rounding moves a value by about 1e-15 relative, and a cancellation-heavy feature such as
+kurtosis amplifies that by a few orders of magnitude; changing a feature function moves values
+by far more than 1e-6.
+"""
 
 SIDECAR_SUFFIX: Final = ".sha256"
 _DIGEST: Final = re.compile(r"[0-9a-f]{64}")
@@ -280,9 +300,6 @@ def _specs_for(kind: InputKind) -> tuple[FeatureSpec, ...]:
 
 
 def _payload(bundle: Bundle) -> dict[str, Any]:
-    pipeline = bundle.pipeline
-    # The pipeline has no public accessor for its fitted statistics; state_digest, checked on
-    # load, is what stops this from drifting out of step with the class.
     return {
         "format": FORMAT_VERSION,
         "entity": bundle.entity,
@@ -291,13 +308,8 @@ def _payload(bundle: Bundle) -> dict[str, Any]:
         "threshold": bundle.threshold,
         "source_commit": bundle.source_commit,
         "input_kind": bundle.detector.input_kind,
-        "pipeline": {
-            "columns": pipeline.columns,
-            "fit_end": bundle.fit_end,
-            "mean": np.array(pipeline._mean),
-            "scale": np.array(pipeline._scale),
-            "digest": pipeline.state_digest(),
-        },
+        "pipeline": bundle.pipeline.get_state(),
+        "golden_features": _golden_features(bundle.detector.input_kind),
         "detector": bundle.detector,
         "detector_digest": bundle.detector.state_digest(),
     }
@@ -312,6 +324,7 @@ def _from_payload(payload: object, path: Path) -> Bundle:
     try:
         kind: InputKind = payload["input_kind"]
         pipeline = _restore_pipeline(payload["pipeline"], kind, path)
+        _check_feature_code(payload["golden_features"], kind, pipeline.columns, path)
         detector: Detector = payload["detector"]
         if detector.state_digest() != payload["detector_digest"]:
             raise ContractError(
@@ -331,19 +344,50 @@ def _from_payload(payload: object, path: Path) -> Bundle:
 
 
 def _restore_pipeline(state: dict[str, Any], kind: InputKind, path: Path) -> FeaturePipeline:
-    pipeline = FeaturePipeline(_specs_for(kind))
-    if pipeline.columns != tuple(state["columns"]):
-        raise ContractError(
-            f"{path}: the bundle was fitted on {len(state['columns'])} feature columns that do "
-            f"not match this version's {len(pipeline.columns)}; rebuild the bundle"
+    try:
+        return FeaturePipeline.from_state(_specs_for(kind), state)
+    except ValueError as error:
+        raise ContractError(f"{path}: {error}; rebuild the bundle") from None
+
+
+def _golden_features(kind: InputKind) -> np.ndarray:
+    """Compute the unscaled features of a fixed synthetic window with the current feature code.
+
+    The window is a sawtooth in [0, 1) that differs per channel and per row, built from
+    arithmetic alone so that it is the same on every machine. The returned rows are the
+    `GOLDEN_ROWS` rows with a full window behind them.
+    """
+    specs = _specs_for(kind)
+    lookback = max(spec.lookback for spec in specs)
+    rows = lookback + GOLDEN_ROWS - 1
+    steps = np.outer(np.arange(1, rows + 1), np.arange(3, 3 + N_CHANNELS))
+    window = np.mod(steps * 0.137, 1.0)
+    return compute_raw_features(window, specs, rows=(lookback - 1, rows), n_channels=N_CHANNELS)
+
+
+def _check_feature_code(
+    recorded: np.ndarray, kind: InputKind, columns: tuple[str, ...], path: Path
+) -> None:
+    """Refuse a bundle whose recorded golden features differ from what the code computes now.
+
+    Raises:
+        ChecksumError: A feature function computes other values than when the bundle was built.
+    """
+    current = _golden_features(kind)
+    recorded = np.asarray(recorded, dtype=np.float64)
+    reason = f"{path}: the feature code computes different values than when this bundle was built"
+    advice = (
+        "the scaling fitted for the old features no longer fits the new ones; rebuild the bundle"
+    )
+    if recorded.shape != current.shape:
+        raise ChecksumError(
+            f"{reason}: {recorded.shape[-1]} feature columns were recorded and the code computes "
+            f"{current.shape[-1]}; {advice}"
         )
-    mean, scale = np.array(state["mean"]), np.array(state["scale"])
-    mean.flags.writeable = False
-    scale.flags.writeable = False
-    pipeline._fit_end, pipeline._mean, pipeline._scale = int(state["fit_end"]), mean, scale
-    if pipeline.state_digest() != state["digest"]:
-        raise ContractError(
-            f"{path}: the rebuilt feature pipeline does not reproduce the state recorded when "
-            f"the bundle was saved; rebuild the bundle"
+    close = np.isclose(recorded, current, rtol=GOLDEN_RTOL, atol=GOLDEN_ATOL)
+    if not close.all():
+        column = int(np.argmax(~close.all(axis=0)))
+        raise ChecksumError(
+            f"{reason}: the first difference is in column {columns[column]!r}, "
+            f"{int((~close.all(axis=0)).sum())} columns differ in all; {advice}"
         )
-    return pipeline
