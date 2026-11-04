@@ -17,9 +17,7 @@ if TYPE_CHECKING:
 DEFAULT_PARAMS: Final[Mapping[str, Mapping[str, int | float | str]]] = MappingProxyType(
     {
         "zscore": MappingProxyType({"aggregation": "topk", "k": 32}),
-        "iforest": MappingProxyType(
-            {"n_estimators": 200, "max_samples": 1024, "max_features": 0.5}
-        ),
+        "iforest": MappingProxyType({"n_estimators": 200, "max_samples": 1024}),
         "cnn_ae": MappingProxyType({"window": 32, "width": 64, "latent": 8, "lr": 1e-3}),
         "lstm_ae": MappingProxyType({"window": 32, "hidden": 64, "latent": 8, "lr": 1e-3}),
     }
@@ -53,7 +51,6 @@ def suggest_params(name: str, trial: optuna.trial.BaseTrial) -> dict[str, int | 
             return {
                 "n_estimators": trial.suggest_int("n_estimators", 100, 400, step=50),
                 "max_samples": trial.suggest_int("max_samples", 256, 4096, log=True),
-                "max_features": trial.suggest_float("max_features", 0.1, 1.0),
             }
         case "cnn_ae":
             return {

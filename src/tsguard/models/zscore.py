@@ -1,7 +1,8 @@
 """A robust z-score detector: how far a row sits from the training median, in MAD units.
 
 It is the baseline every other model has to beat. It reads one row at a time, so it needs no
-context, and it has no random state.
+context, and it has no random state. The scale is floored at one training standard deviation, so
+a near-constant column cannot dominate a score.
 """
 
 from __future__ import annotations
@@ -17,13 +18,21 @@ Aggregation = Literal["mean", "max", "topk"]
 
 _MAD_TO_SIGMA: Final = 1.4826  # makes the MAD a consistent estimator of sigma for normal data
 
+# The inputs are already standardized to unit training standard deviation, so a robust scale is
+# never allowed to be sharper than one training standard deviation. Without the floor, a column
+# that is almost always constant with rare spikes has MAD close to 0 but a standard deviation of
+# 1, and its z-scores reach 1e3 to 1e4 for ordinary spikes.
+_MIN_SCALE: Final = 1.0
+
 
 class ZScoreDetector:
     """Score a row by its robust z-scores against the training median.
 
-    ``fit`` stores, per column, the median and ``1.4826 * MAD`` (a column whose MAD is zero gets
-    scale 1, so a constant column scores its raw distance and never divides by zero). ``score``
-    takes ``|x - median| / scale`` per column and reduces each row to one number.
+    ``fit`` stores, per column, the median and ``max(1.4826 * MAD, 1)``. The inputs are
+    standardized to unit training standard deviation, so the floor of 1 keeps a near-constant
+    column from scoring its spikes in the thousands, and a constant column (MAD zero) scores its
+    raw distance instead of dividing by zero. ``score`` takes ``|x - median| / scale`` per column
+    and reduces each row to one number.
 
     Attributes:
         name: ``"zscore"``.
@@ -72,7 +81,7 @@ class ZScoreDetector:
             raise ValueError("zscore cannot fit on zero rows")
         median = np.median(data, axis=0)
         scale = _MAD_TO_SIGMA * np.median(np.abs(data - median), axis=0)
-        scale[scale == 0.0] = 1.0
+        scale = np.maximum(scale, _MIN_SCALE)
         median.flags.writeable = False
         scale.flags.writeable = False
         self._median, self._scale = median, scale

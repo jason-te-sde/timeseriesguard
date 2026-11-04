@@ -26,7 +26,7 @@ class IsolationForestDetector:
         lookback: ``1``; a score reads only its own row.
         n_estimators: Number of trees.
         max_samples: Rows drawn for each tree, before clipping to the rows given to ``fit``.
-        max_features: Fraction of the columns each tree sees.
+        max_features: Fraction of the columns each tree sees; 1.0 gives every tree all of them.
         seed: Seed of the forest.
         n_jobs: Threads used to fit the forest.
     """
@@ -36,7 +36,7 @@ class IsolationForestDetector:
         *,
         n_estimators: int = 200,
         max_samples: int = 1024,
-        max_features: float = 0.5,
+        max_features: float = 1.0,
         seed: int,
         n_jobs: int = 4,
     ) -> None:
@@ -46,7 +46,11 @@ class IsolationForestDetector:
             n_estimators: Number of trees. Must be at least 1.
             max_samples: Rows drawn for each tree. Must be at least 1; ``fit`` clips it to the
                 number of rows it receives.
-            max_features: Fraction of the columns each tree sees, in ``(0, 1]``.
+            max_features: Fraction of the columns each tree sees, in ``(0, 1]``. The default of
+                1.0 turns feature bagging off: an Isolation Forest already draws a random feature
+                at every split, and a smaller fraction makes scikit-learn copy a column subset
+                for every tree (on 24,000 rows by 2,246 columns with 200 trees, fitting took
+                0.2 s at 1.0 and 14.7 s at 0.5).
             seed: Seed of the forest. The same seed on the same rows gives the same trees,
                 whatever ``n_jobs`` is.
             n_jobs: Threads used to fit. Must be at least 1.

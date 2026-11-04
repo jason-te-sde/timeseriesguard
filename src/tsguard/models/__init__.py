@@ -23,7 +23,9 @@ def build_detector(
 ) -> Detector:
     """Build an unfitted detector from its registry name and hyperparameters.
 
-    Parameters the model has a default for may be left out of ``params``.
+    Parameters the model has a default for may be left out of ``params``. The Isolation Forest
+    also takes ``max_features`` (default 1.0, no feature bagging), which the search space does
+    not tune.
 
     Args:
         name: One of `MODEL_NAMES`.

@@ -55,8 +55,26 @@ def test_zscore_zero_mad_column_is_finite():
 def test_zscore_zero_mad_column_scores_its_raw_distance():
     d = ZScoreDetector(aggregation="max")
     d.fit(np.ones((50, 4)))
-    # the zero MAD makes the scale fall back to 1, so |3 - 1| / 1 = 2
+    # the zero MAD leaves the scale at its floor of 1, so |3 - 1| / 1 = 2
     assert d.score(np.full((1, 4), 3.0), context=0)[0] == pytest.approx(2.0)
+
+
+def test_zscore_scale_is_floored_at_one_training_standard_deviation():
+    # Median 0 and MAD 0.001: the robust scale would be 0.0015, so a shift of 3 would score 2000.
+    # Inputs are standardized to unit training standard deviation, so the scale stops at 1.
+    d = ZScoreDetector(aggregation="max")
+    d.fit(np.tile(np.array([[-0.001], [0.0], [0.001]]), (50, 1)))
+    assert d.score(np.array([[3.0]]), context=0)[0] == 3.0
+
+
+def test_zscore_floor_applies_per_column_and_leaves_wider_columns_alone():
+    # Column 0 has MAD 2, scale 2.9652 (above the floor, unchanged); column 1 has MAD 0.001.
+    X = np.array([[0.0, -0.001], [2.0, 0.0], [4.0, 0.001]])
+    d = ZScoreDetector(aggregation="mean")
+    d.fit(np.tile(X, (50, 1)))
+    row = np.array([[8.0, 3.0]])
+    expected = (6.0 / (1.4826 * 2.0) + 3.0) / 2
+    assert d.score(row, context=0)[0] == pytest.approx(expected)
 
 
 def test_zscore_context_drops_rows(rng):
@@ -143,6 +161,18 @@ def test_iforest_ranks_an_outlier_above_inliers(rng):
     d.fit(inliers)
     outlier = np.full((1, 20), 10.0)
     assert d.score(outlier, context=0)[0] > np.percentile(d.score(inliers, context=0), 99)
+
+
+def test_iforest_trees_see_every_column_by_default(rng):
+    # Isolation Forest already draws a random feature at each split; bagging columns per tree
+    # only adds a column copy per tree, so the default gives every tree all of them.
+    X = rng.standard_normal((200, 9))
+    d = IsolationForestDetector(n_estimators=10, seed=0, n_jobs=1)
+    assert d.max_features == 1.0
+    d.fit(X)
+    assert d._model is not None
+    for subset in d._model.estimators_features_:
+        np.testing.assert_array_equal(subset, np.arange(9))
 
 
 def test_iforest_clips_max_samples_to_rows(rng):
@@ -263,6 +293,16 @@ def test_build_detector_passes_params_seed_and_threads_to_iforest():
     assert (d.seed, d.n_jobs) == (11, 2)
 
 
+def test_build_detector_defaults_iforest_to_every_column_and_still_takes_max_features():
+    assert dict(DEFAULT_PARAMS["iforest"]) == {"n_estimators": 200, "max_samples": 1024}
+    default = build_detector("iforest", DEFAULT_PARAMS["iforest"], seed=0)
+    assert isinstance(default, IsolationForestDetector)
+    assert (default.n_estimators, default.max_samples, default.max_features) == (200, 1024, 1.0)
+    bagged = build_detector("iforest", {"max_features": 0.25}, seed=0)
+    assert isinstance(bagged, IsolationForestDetector)
+    assert bagged.max_features == 0.25
+
+
 def test_build_detector_passes_params_to_zscore():
     d = build_detector("zscore", {"aggregation": "max", "k": 9}, seed=0)
     assert isinstance(d, ZScoreDetector)
@@ -273,6 +313,13 @@ def test_suggest_params_covers_defaults_keys():
     for name in FEATURE_MODELS:
         trial = optuna.trial.FixedTrial(dict(DEFAULT_PARAMS[name]))
         assert suggest_params(name, trial) == dict(DEFAULT_PARAMS[name])
+
+
+def test_iforest_search_space_does_not_tune_feature_bagging():
+    params = suggest_params(
+        "iforest", optuna.trial.FixedTrial({"n_estimators": 150, "max_samples": 512})
+    )
+    assert params == {"n_estimators": 150, "max_samples": 512}
 
 
 def test_suggest_params_stays_in_range_and_always_suggests_every_key():
@@ -300,8 +347,6 @@ def test_suggest_params_stays_in_range_and_always_suggests_every_key():
         assert f["n_estimators"] in range(100, 401, 50)
         assert isinstance(f["max_samples"], int)
         assert 256 <= f["max_samples"] <= 4096
-        assert isinstance(f["max_features"], float)
-        assert 0.1 <= f["max_features"] <= 1.0
 
 
 def test_suggest_params_unknown_model_names_the_valid_ones():
