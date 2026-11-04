@@ -56,8 +56,10 @@ def test_derive_seed_fits_in_32_bits_and_depends_on_root():
 
 
 def test_array_digest_sees_dtype_and_shape():
+    # Each pair has identical bytes, so each comparison isolates exactly one property.
     a = np.zeros(4)
-    assert array_digest(a) != array_digest(a.astype(np.float32)) != array_digest(a.reshape(2, 2))
+    assert array_digest(a) != array_digest(np.zeros(4, dtype=np.int64))
+    assert array_digest(a) != array_digest(a.reshape(2, 2))
 
 
 def test_array_digest_ignores_memory_layout():
