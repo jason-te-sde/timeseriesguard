@@ -175,6 +175,9 @@ How it is done here (`tsguard.eval.inject`, `tsguard.experiment.runner`):
 - **Headline.** The headline model is the one with the highest validation objective, averaged over
   the evaluated entities. It is chosen and announced before the first test label is read, and
   `metrics.json` records `selected_by: "validation_objective"` and `label_reads_at_selection: 0`.
+  Reading the file checks the choice again: a `metrics.json` whose headline is not the model with
+  the highest validation objective (a tie goes to the earlier of `zscore`, `iforest`, `cnn_ae`,
+  `lstm_ae`) is invalid, and the README's model table prints that objective next to the scores.
 
 Why not the alternatives (see [ADR 0002](adr/0002-label-free-model-selection.md)): tuning on test
 labels reports an oracle, not a result; and carving a labelled validation slice out of the test half

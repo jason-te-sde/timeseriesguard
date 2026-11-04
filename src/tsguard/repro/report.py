@@ -4,21 +4,28 @@
 it and from nothing else, so a number that appears in the README can always be traced to a field
 here. Every model forbids unknown fields, so a typo in a field name fails at validation, and
 every float must be finite, so a NaN fails there too instead of corrupting a comparison later.
-`Metrics` also checks that the headline agrees with the model table it was taken from. The models
-are frozen, which blocks attribute assignment only: the dicts and lists inside stay mutable, so
-treat a built `Metrics` as read-only.
+`Metrics` also checks that the headline agrees with the model table it was taken from: it is the
+model with the best validation objective (`best_model`, the one rule the experiment and the
+validation share), under a count of label reads that cannot be negative. The models are frozen,
+which blocks attribute assignment only: the dicts and lists inside stay mutable, so treat a built
+`Metrics` as read-only.
 """
 
 from __future__ import annotations
 
 import json
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Annotated, Final, Literal, Self
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from tsguard.models import MODEL_NAMES
+
+FULL_PROFILE: Final = "full"
+"""The profile name of a run over every machine; only such a run is published."""
 
 PERCENTILES: Final = (2.5, 97.5)
 """The percentiles that bound a 95 % bootstrap interval."""
@@ -28,6 +35,29 @@ FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
 
 HEADLINE_AUC_TOLERANCE: Final = 1e-9
 """How far ``headline.auc_pr`` may sit from the model table's value before they disagree."""
+
+
+def best_model(validation_objective: Mapping[str, float]) -> str:
+    """Return the model with the highest validation objective.
+
+    The experiment chooses its headline with this function, and `Metrics` validation checks
+    the headline against it, so the rule exists once.
+
+    Args:
+        validation_objective: Macro validation objective by model name; not empty.
+
+    Returns:
+        The winner. A tie goes to the model that comes first in `MODEL_NAMES`, whatever the
+        order of the mapping; names outside `MODEL_NAMES` rank after it, in sorted order.
+
+    Raises:
+        ValueError: ``validation_objective`` is empty.
+    """
+    if not validation_objective:
+        raise ValueError("no validation objectives to choose a model from")
+    known = [name for name in MODEL_NAMES if name in validation_objective]
+    ranked = known + sorted(set(validation_objective) - set(MODEL_NAMES))
+    return max(ranked, key=lambda name: validation_objective[name])
 
 
 class _Strict(BaseModel):
@@ -181,8 +211,11 @@ class Metrics(_Strict):
     """Everything a ``reproduce`` run measured: the content of ``metrics.json``.
 
     Besides the per-field checks, validation requires ``models`` to be non-empty, the headline
-    model to be one of them, and the headline AUC-PR to equal that model's macro score under
-    the headline protocol, so a file that contradicts itself is invalid, not merely odd.
+    model to be the one with the highest validation objective (`best_model`), the count of label
+    reads at selection to be at least 0, and the headline AUC-PR to equal that model's macro
+    score under the headline protocol, so a file that contradicts itself is invalid, not merely
+    odd. Whether a run may be *published* (a full run, with no label read) is a separate
+    question, answered by `tsguard.repro.claims.publishable_problems`.
 
     Attributes:
         schema_version: Version of this schema; bumped when a field changes meaning.
@@ -217,14 +250,26 @@ class Metrics(_Strict):
         """Require the headline to be the number the model table already holds.
 
         Raises:
-            ValueError: ``models`` is empty; the headline model is not in ``models``; it has no
-                macro score for the headline protocol; or the headline AUC-PR is not that score.
+            ValueError: ``models`` is empty; the headline model is not in ``models`` or is not
+                the one with the highest validation objective; the count of label reads is
+                negative; the headline model has no macro score for the headline protocol; or
+                the headline AUC-PR is not that score.
         """
         if not self.models:
             raise ValueError("models must not be empty")
         name, protocol = self.headline.model, self.headline.protocol
         if name not in self.models:
             raise ValueError(f"headline.model {name!r} is not in models ({sorted(self.models)})")
+        objectives = {model: summary.validation_objective for model, summary in self.models.items()}
+        best = best_model(objectives)
+        if name != best:
+            raise ValueError(
+                f"headline.model {name!r} is not the model with the highest validation "
+                f"objective: {best!r} ({objectives[best]!r}) is, {name!r} has {objectives[name]!r}"
+            )
+        reads = self.headline.label_reads_at_selection
+        if reads < 0:
+            raise ValueError(f"headline.label_reads_at_selection must not be negative, got {reads}")
         macro = self.models[name].macro
         if protocol not in macro:
             raise ValueError(

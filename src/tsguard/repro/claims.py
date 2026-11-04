@@ -5,7 +5,9 @@
 record; `write_claims` stores that record as ``reports/claims.json`` and renders it into the
 README between two marker lines; `check_claims` recomputes everything and names each place where
 a stored file disagrees. A number is therefore never typed into the README by hand, and CI can
-fail when one drifts.
+fail when one drifts. Only a publishable run is written or accepted: `publishable_problems`
+names what keeps a smoke run, a partial run or a run with a label read from standing behind the
+README.
 """
 
 from __future__ import annotations
@@ -20,8 +22,10 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Final
 
+from tsguard.data.smd import ENTITIES
 from tsguard.eval.protocols import PROTOCOLS
-from tsguard.repro.report import AblationModel, Metrics, read_metrics
+from tsguard.models import FEATURE_MODELS
+from tsguard.repro.report import FULL_PROFILE, AblationModel, Metrics, best_model, read_metrics
 
 BEGIN: Final = "<!-- claims:begin -->"
 """The README line that opens the generated block."""
@@ -83,6 +87,49 @@ class Claims:
     mlflow_runs: int
     p95_ms: float | None
     p95_budget_ms: float
+
+
+def publishable_problems(metrics: Metrics) -> list[str]:
+    """Name every reason the run behind ``metrics`` must not stand behind the README.
+
+    A valid `Metrics` can still describe a run that proves nothing about the project: a smoke
+    run, one over a few machines, one without both ablations, one that read a test label while
+    selecting, or one whose headline is not the model its own table picks. The last cannot be
+    read from a file (validation refuses it), but a `Metrics` built in code may still carry it.
+
+    Args:
+        metrics: The metrics to judge.
+
+    Returns:
+        One message per violated condition, in a fixed order; empty when the run is publishable.
+    """
+    problems = []
+    if metrics.profile != FULL_PROFILE:
+        problems.append(
+            f"profile is {metrics.profile!r}, not {FULL_PROFILE!r}: only a full run is publishable"
+        )
+    if metrics.dataset.entities != len(ENTITIES):
+        problems.append(
+            f"dataset.entities is {metrics.dataset.entities}, a full run covers all {len(ENTITIES)}"
+        )
+    if set(metrics.ablation) != set(FEATURE_MODELS):
+        problems.append(
+            f"ablation covers {sorted(metrics.ablation)}, a full run covers "
+            f"{sorted(FEATURE_MODELS)}"
+        )
+    reads = metrics.headline.label_reads_at_selection
+    if reads != 0:
+        problems.append(
+            f"headline.label_reads_at_selection is {reads}, not 0: a test label was read before "
+            f"the headline was chosen"
+        )
+    objectives = {name: summary.validation_objective for name, summary in metrics.models.items()}
+    if objectives and metrics.headline.model != best_model(objectives):
+        problems.append(
+            f"headline.model is {metrics.headline.model!r} but {best_model(objectives)!r} has "
+            f"the highest validation objective"
+        )
+    return problems
 
 
 def _round(value: float, digits: int) -> float:
@@ -203,10 +250,13 @@ def _claims_rows(claims: Claims) -> list[str]:
 
 
 def _protocol_rows(claims: Claims, metrics: Metrics) -> list[str]:
-    rows = [_row(["Model", *PROTOCOLS]), _row(["---", *["---:"] * len(PROTOCOLS)])]
+    rows = [
+        _row(["Model", "Validation objective", *PROTOCOLS]),
+        _row(["---", *["---:"] * (len(PROTOCOLS) + 1)]),
+    ]
     for name in _ordered(metrics.models):
         macro = metrics.models[name].macro
-        cells = [name]
+        cells = [name, f"{metrics.models[name].validation_objective:.3f}"]
         for protocol in PROTOCOLS:
             if protocol not in macro:
                 raise ValueError(f"model {name!r} has no macro score for protocol {protocol!r}")
@@ -243,9 +293,10 @@ def _ablation_rows(claims: Claims, metrics: Metrics) -> list[str]:
 def render_readme_block(claims: Claims, metrics: Metrics) -> str:
     """Render the generated README block, from the begin marker to the end marker.
 
-    The block holds three tables: the claims (claim, value), the macro AUC-PR of every model
-    under every protocol with the headline model's row in bold, and the FFT ablation. The output
-    depends only on the arguments, so rendering twice gives the same text.
+    The block holds three tables: the claims (claim, value), every model's macro validation
+    objective (what the headline was chosen by) and macro AUC-PR under every protocol with the
+    headline model's row in bold, and the FFT ablation. The output depends only on the
+    arguments, so rendering twice gives the same text.
 
     Args:
         claims: The derived claims.
@@ -262,7 +313,8 @@ def render_readme_block(claims: Claims, metrics: Metrics) -> str:
         BEGIN,
         *_claims_rows(claims),
         "",
-        "Macro-mean AUC-PR over entities under each evaluation protocol (headline model in bold):",
+        "Macro-mean validation objective (on injected anomalies, what the headline was chosen by) "
+        "and AUC-PR under each evaluation protocol, over entities (headline model in bold):",
         "",
         *_protocol_rows(claims, metrics),
         "",
@@ -307,19 +359,24 @@ def _derive_from_reports(reports: Path, metrics: Metrics) -> Claims:
 def write_claims(root: Path) -> None:
     """Write ``reports/claims.json`` and refresh the README block.
 
-    Nothing is written unless both can be: the README is checked for its markers first.
+    Nothing is written unless both can be: the metrics must be publishable and the README must
+    hold its markers.
 
     Args:
         root: The repository root, holding ``README.md`` and ``reports/``.
 
     Raises:
-        ValueError: The README lacks the begin or end marker line, has one twice, or has them
-            in the wrong order; or an input file is malformed (see `derive_claims`).
+        ValueError: The metrics are not publishable (see `publishable_problems`; the message
+            lists every problem); the README lacks the begin or end marker line, has one twice,
+            or has them in the wrong order; or an input file is malformed (see `derive_claims`).
         FileNotFoundError: ``reports/metrics.json``, ``reports/mlflow_runs.csv`` or the README
             does not exist.
     """
     reports = root / _REPORTS
     metrics = read_metrics(reports / "metrics.json")
+    problems = publishable_problems(metrics)
+    if problems:
+        raise ValueError(f"{_REPORTS}/metrics.json is not publishable: " + "; ".join(problems))
     claims = _derive_from_reports(reports, metrics)
     readme_path = root / "README.md"
     readme = readme_path.read_text(encoding="utf-8")
@@ -399,9 +456,11 @@ def check_claims(root: Path) -> list[str]:
         root: The repository root, holding ``README.md`` and ``reports/``.
 
     Returns:
-        One message per problem, empty when everything agrees: each field of ``claims.json``
-        that differs (``"claims.json: headline_auc_pr is 0.80, metrics.json gives 0.82"``),
-        a stale README block, and fewer than `MIN_MLFLOW_RUNS` tracked runs.
+        One message per problem, empty when everything agrees. A run that is not publishable
+        (see `publishable_problems`) gives one message per problem and nothing else, since no
+        claim can be derived from it. Otherwise: each field of ``claims.json`` that differs
+        (``"claims.json: headline_auc_pr is 0.80, metrics.json gives 0.82"``), a stale README
+        block, and fewer than `MIN_MLFLOW_RUNS` tracked runs.
 
     Raises:
         ValueError: The README lacks the begin or end marker line, has one twice, or has them
@@ -421,6 +480,9 @@ def check_claims(root: Path) -> list[str]:
         metrics = read_metrics(metrics_path)
     except ValueError as exc:
         return [f"{_REPORTS}/metrics.json: invalid: {_one_line(exc)}"]
+    problems = publishable_problems(metrics)
+    if problems:
+        return [f"{_REPORTS}/metrics.json: not publishable: {problem}" for problem in problems]
     try:
         claims = _derive_from_reports(reports, metrics)
     except ValueError as exc:

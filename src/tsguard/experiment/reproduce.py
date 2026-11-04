@@ -63,6 +63,7 @@ from tsguard.experiment.tuning import FINAL_EXPERIMENT, TuningResult, tune
 from tsguard.features.specs import FEATURE_SPECS
 from tsguard.models import FEATURE_MODELS, MODEL_NAMES
 from tsguard.repro.report import (
+    FULL_PROFILE,
     AblationModel,
     DatasetModel,
     EntityResultModel,
@@ -71,6 +72,7 @@ from tsguard.repro.report import (
     ModelSummaryModel,
     ProtocolScoreModel,
     TuningModel,
+    best_model,
     bootstrap_ci,
     write_metrics,
 )
@@ -123,7 +125,12 @@ class Profile:
 
 
 FULL: Final = Profile(
-    "full", ENTITIES, ("machine-1-1", "machine-2-1", "machine-3-1"), 8, (0, 1, 2, 3, 4), RunConfig()
+    FULL_PROFILE,
+    ENTITIES,
+    ("machine-1-1", "machine-2-1", "machine-3-1"),
+    8,
+    (0, 1, 2, 3, 4),
+    RunConfig(),
 )
 """All 28 machines, 8 tuning trials per model, five ablation seeds."""
 
@@ -491,20 +498,6 @@ def _summarize_model(
         },
         per_entity=per_entity,
     )
-
-
-def best_model(validation_objective: Mapping[str, float]) -> str:
-    """Return the model with the highest validation objective.
-
-    Args:
-        validation_objective: Macro validation objective by model name; it must hold every
-            name in `MODEL_NAMES`.
-
-    Returns:
-        The winner. A tie goes to the model that comes first in `MODEL_NAMES`, whatever the
-        order of the mapping.
-    """
-    return max(MODEL_NAMES, key=lambda model: validation_objective[model])
 
 
 def _macro_objectives(records: Sequence[_EntityRecord]) -> dict[str, float]:

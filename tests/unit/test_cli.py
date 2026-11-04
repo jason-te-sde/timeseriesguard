@@ -63,6 +63,23 @@ def test_claims_with_broken_readme_markers_exit_1_with_the_message(repo, capsys)
         assert "Traceback" not in err
 
 
+def test_claims_refuse_a_run_that_is_not_publishable_with_one_message_per_problem(repo, capsys):
+    metrics = tiny_metrics()
+    smoke = metrics.model_copy(update={"profile": "smoke"})
+    write_metrics(repo / "reports" / "metrics.json", smoke)
+    assert main(["claims", "--write", "--root", str(repo)]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("tsguard: error: reports/metrics.json is not publishable: profile is ")
+    assert "Traceback" not in err
+    assert not (repo / "reports" / "claims.json").exists()
+    assert main(["claims", "--check", "--root", str(repo)]) == 1
+    out = capsys.readouterr().out
+    assert out.splitlines() == [
+        "reports/metrics.json: not publishable: profile is 'smoke', not 'full': "
+        "only a full run is publishable"
+    ]
+
+
 def test_claims_write_without_reports_exits_1(tmp_path, capsys):
     assert main(["claims", "--write", "--root", str(tmp_path)]) == 1
     assert "metrics.json" in capsys.readouterr().err

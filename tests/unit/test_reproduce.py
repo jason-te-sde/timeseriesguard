@@ -30,7 +30,6 @@ from tsguard.experiment.reproduce import (
     PROFILES,
     SMOKE,
     Profile,
-    best_model,
     git_revision,
     label_reads_at_selection,
     reproduce,
@@ -41,7 +40,7 @@ from tsguard.experiment.tracking import MemoryTracker
 from tsguard.experiment.tuning import FINAL_EXPERIMENT, TUNING_EXPERIMENT
 from tsguard.models import MODEL_NAMES
 from tsguard.models.space import DEFAULT_PARAMS
-from tsguard.repro.report import Metrics, read_metrics
+from tsguard.repro.report import Metrics, best_model, read_metrics
 
 
 @dataclass
@@ -369,17 +368,6 @@ def test_a_missing_experiment_extra_is_an_import_error_that_names_it(monkeypatch
     monkeypatch.setitem(sys.modules, "optuna", None)
     with pytest.raises(ImportError, match=r"experiment"):
         require_experiment_extra()
-
-
-def test_best_model_is_the_highest_validation_objective():
-    objective = {"zscore": 0.2, "iforest": 0.3, "cnn_ae": 0.9, "lstm_ae": 0.5}
-    assert best_model(objective) == "cnn_ae"
-
-
-def test_a_tie_for_the_best_model_goes_to_the_earlier_registry_name():
-    tied = {"lstm_ae": 0.7, "cnn_ae": 0.7, "iforest": 0.1, "zscore": 0.2}  # not in registry order
-    assert best_model(tied) == "cnn_ae"
-    assert best_model({name: 0.5 for name in reversed(MODEL_NAMES)}) == MODEL_NAMES[0]
 
 
 def test_selection_that_read_no_label_is_clean():

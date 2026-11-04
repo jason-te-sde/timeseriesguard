@@ -10,7 +10,9 @@ import numpy as np
 import pytest
 from pydantic import ValidationError
 
+from tsguard.data.smd import ENTITIES
 from tsguard.eval.protocols import PROTOCOLS
+from tsguard.models import FEATURE_MODELS, MODEL_NAMES
 from tsguard.repro import claims as claims_module
 from tsguard.repro import report as report_module
 from tsguard.repro.claims import (
@@ -19,6 +21,7 @@ from tsguard.repro.claims import (
     P95_BUDGET_MS,
     check_claims,
     derive_claims,
+    publishable_problems,
     render_readme_block,
     write_claims,
 )
@@ -31,6 +34,7 @@ from tsguard.repro.report import (
     ModelSummaryModel,
     ProtocolScoreModel,
     TuningModel,
+    best_model,
     bootstrap_ci,
     deterministic_view,
     read_metrics,
@@ -44,6 +48,8 @@ MACRO_AUC_PR = {
     "cnn_ae": (0.4149, 0.9734, 0.4851, 0.8234),
     "iforest": (0.1876, 0.7011, 0.3302, 0.5538),
 }
+# Macro validation objective per model; the headline is the one with the highest.
+VALIDATION_OBJECTIVE = {"lstm_ae": 0.63, "zscore": 0.41, "cnn_ae": 0.77, "iforest": 0.52}
 HEADLINE = "cnn_ae"
 STALE_README = "README block differs from metrics.json; run `tsguard claims --write`"
 README_TEXT = f"# Demo\n\nIntro.\n\n{BEGIN}\n{END}\n\n## After\n\nFooter.\n"
@@ -59,10 +65,12 @@ def _scores(values: tuple[float, ...], shift: float = 0.0) -> dict[str, Protocol
     }
 
 
-def _entity(name: str, values: tuple[float, ...], shift: float) -> EntityResultModel:
+def _entity(
+    name: str, values: tuple[float, ...], objective: float, shift: float
+) -> EntityResultModel:
     return EntityResultModel(
         entity=name,
-        validation_objective=0.5 + shift,
+        validation_objective=objective + shift,
         threshold=0.9,
         protocols=_scores(values, shift),
         sensitivity={"chunk_30": 0.7, "chunk_120": 0.8},
@@ -70,15 +78,15 @@ def _entity(name: str, values: tuple[float, ...], shift: float) -> EntityResultM
     )
 
 
-def _summary(values: tuple[float, ...]) -> ModelSummaryModel:
+def _summary(values: tuple[float, ...], objective: float) -> ModelSummaryModel:
     return ModelSummaryModel(
         params={"window": 32, "learning_rate": 0.001, "kind": "tiny"},
-        validation_objective=0.5,
+        validation_objective=objective,
         macro=_scores(values),
         sensitivity_macro={"chunk_30": 0.7, "chunk_120": 0.8},
         per_entity=[
-            _entity("machine-1-1", values, 0.01),
-            _entity("machine-2-1", values, -0.01),
+            _entity("machine-1-1", values, objective, 0.01),
+            _entity("machine-2-1", values, objective, -0.01),
         ],
     )
 
@@ -103,14 +111,18 @@ def _ablation(
 
 
 def tiny_metrics() -> Metrics:
-    """Build a valid Metrics with 4 models (inserted out of report order) and 2 entities."""
+    """Build a valid, publishable Metrics: 4 models (out of report order), a full-run shape.
+
+    The model tables hold two entities, not 28: nothing checks their number against
+    ``dataset.entities``, and two keep the fixture small.
+    """
     return Metrics(
         schema_version=1,
-        profile="tiny",
+        profile="full",
         seed=0,
         dataset=DatasetModel(
             source_commit="7fb0e0acf89ea49908896bcc9f9e80fcfff6baf4",
-            entities=2,
+            entities=len(ENTITIES),
             channels=38,
             train_steps=708405,
             test_steps=708420,
@@ -118,7 +130,10 @@ def tiny_metrics() -> Metrics:
         ),
         protocol={"chunk": 60, "cooldown": 60, "k_percent": 20},
         feature_specs=63,
-        models={name: _summary(values) for name, values in MACRO_AUC_PR.items()},
+        models={
+            name: _summary(values, VALIDATION_OBJECTIVE[name])
+            for name, values in MACRO_AUC_PR.items()
+        },
         headline=HeadlineModel(
             model=HEADLINE,
             protocol="event_level",
@@ -305,6 +320,15 @@ def test_block_is_deterministic_and_ordered_by_report_order(repo):
     assert order[:4] == ["zscore", "iforest", "cnn_ae", "lstm_ae"]  # the macro AUC-PR table
 
 
+def test_the_model_table_shows_what_the_headline_was_chosen_by(repo):
+    lines = render_readme_block(_derive(repo), tiny_metrics()).splitlines()
+    header = next(i for i, line in enumerate(lines) if line.startswith("| Model | Validation"))
+    table = lines[header + 2 : lines.index("", header)]  # the rows under the header and its rule
+    rows = {line.split("|")[1].strip(" *"): line.split("|")[2].strip(" *") for line in table}
+    assert rows == {name: f"{value:.3f}" for name, value in VALIDATION_OBJECTIVE.items()}
+    assert max(rows, key=lambda name: rows[name]) == HEADLINE  # the bold row has the highest
+
+
 def test_block_claims_table_and_headline_row(repo):
     block = render_readme_block(_derive(repo), tiny_metrics())
     assert "| Training steps | 708,405 |" in block
@@ -312,9 +336,13 @@ def test_block_claims_table_and_headline_row(repo):
     assert "| Headline event-level AUC-PR | 0.82 (95% CI 0.71 to 0.91) |" in block
     assert "| MLflow runs | 32 |" in block
     assert "| p95 inference latency | 12.3 ms (budget 50 ms) |" in block
-    assert "| zscore | 0.11 | 0.62 | 0.20 | 0.40 |" in block
-    assert "| **cnn_ae** | **0.41** | **0.97** | **0.49** | **0.82** |" in block
-    assert block.count("**") == 10  # only the headline row is bold
+    header = (
+        "| Model | Validation objective | point_wise | point_adjust | pa_percent_k | event_level |"
+    )
+    assert header in block
+    assert "| zscore | 0.410 | 0.11 | 0.62 | 0.20 | 0.40 |" in block
+    assert "| **cnn_ae** | **0.770** | **0.41** | **0.97** | **0.49** | **0.82** |" in block
+    assert block.count("**") == 12  # only the headline row is bold
 
 
 def test_block_says_so_when_latency_was_not_measured(repo):
@@ -577,6 +605,53 @@ def test_headline_auc_pr_must_match_to_a_tight_tolerance():
         Metrics.model_validate(raw)
 
 
+def test_the_headline_must_be_the_model_with_the_highest_validation_objective():
+    raw = _raw()
+    raw["models"]["zscore"]["validation_objective"] = 0.99
+    with pytest.raises(ValidationError) as excinfo:
+        Metrics.model_validate(raw)
+    assert "headline.model 'cnn_ae' is not the model with the highest validation objective" in str(
+        excinfo.value
+    )
+    assert "'zscore' (0.99)" in str(excinfo.value)
+
+
+def test_a_tie_for_the_best_validation_objective_goes_to_the_earlier_registry_name():
+    raw = _raw()
+    raw["models"]["lstm_ae"]["validation_objective"] = raw["models"][HEADLINE][
+        "validation_objective"
+    ]
+    Metrics.model_validate(raw)  # cnn_ae and lstm_ae tie, and cnn_ae comes first
+    raw["headline"]["model"] = "lstm_ae"
+    raw["headline"]["auc_pr"] = raw["models"]["lstm_ae"]["macro"]["event_level"]["auc_pr"]
+    with pytest.raises(ValidationError, match="not the model with the highest validation"):
+        Metrics.model_validate(raw)
+
+
+def test_a_negative_count_of_label_reads_is_rejected():
+    raw = _raw()
+    raw["headline"]["label_reads_at_selection"] = -1
+    with pytest.raises(ValidationError, match=r"label_reads_at_selection must not be negative"):
+        Metrics.model_validate(raw)
+
+
+def test_best_model_is_the_highest_validation_objective():
+    objective = {"zscore": 0.2, "iforest": 0.3, "cnn_ae": 0.9, "lstm_ae": 0.5}
+    assert best_model(objective) == "cnn_ae"
+
+
+def test_a_tie_for_the_best_model_goes_to_the_earlier_registry_name():
+    tied = {"lstm_ae": 0.7, "cnn_ae": 0.7, "iforest": 0.1, "zscore": 0.2}  # not in registry order
+    assert best_model(tied) == "cnn_ae"
+    assert best_model({name: 0.5 for name in reversed(MODEL_NAMES)}) == MODEL_NAMES[0]
+
+
+def test_best_model_ranks_a_name_outside_the_registry_after_the_registered_ones():
+    assert best_model({"zzz": 0.5, "aaa": 0.5, "lstm_ae": 0.5}) == "lstm_ae"
+    assert best_model({"zzz": 0.5, "aaa": 0.5}) == "aaa"
+    assert best_model({"zzz": 0.9, "lstm_ae": 0.5}) == "zzz"
+
+
 def test_check_claims_reports_a_self_contradictory_metrics_file_as_invalid(repo):
     raw = _raw()
     _headline_auc_disagrees(raw)
@@ -696,6 +771,124 @@ def test_a_source_changed_after_write_claims_is_reported(repo, change, expected)
     assert check_claims(repo) == []
     change(repo)
     assert check_claims(repo) == expected
+
+
+def _with(metrics: Metrics, **changes: Any) -> Metrics:
+    """Copy ``metrics`` with fields replaced and NOT validated, as only a hand edit could."""
+    return metrics.model_copy(update=changes)
+
+
+def _smoke_profile(metrics: Metrics) -> Metrics:
+    return _with(metrics, profile="smoke")
+
+
+def _two_entities(metrics: Metrics) -> Metrics:
+    return _with(metrics, dataset=metrics.dataset.model_copy(update={"entities": 2}))
+
+
+def _one_ablation(metrics: Metrics) -> Metrics:
+    return _with(metrics, ablation={"zscore": metrics.ablation["zscore"]})
+
+
+def _extra_ablation(metrics: Metrics) -> Metrics:
+    return _with(metrics, ablation={**metrics.ablation, "cnn_ae": metrics.ablation["zscore"]})
+
+
+def _labels_read(metrics: Metrics) -> Metrics:
+    headline = metrics.headline.model_copy(update={"label_reads_at_selection": 3})
+    return _with(metrics, headline=headline)
+
+
+def _wrong_headline(metrics: Metrics) -> Metrics:
+    return _with(metrics, headline=metrics.headline.model_copy(update={"model": "zscore"}))
+
+
+PUBLISHABLE_PROBLEMS = [
+    pytest.param(
+        _smoke_profile, "profile is 'smoke', not 'full': only a full run is publishable", id="smoke"
+    ),
+    pytest.param(
+        _two_entities,
+        f"dataset.entities is 2, a full run covers all {len(ENTITIES)}",
+        id="entities",
+    ),
+    pytest.param(
+        _one_ablation,
+        f"ablation covers ['zscore'], a full run covers {sorted(FEATURE_MODELS)}",
+        id="ablation-missing",
+    ),
+    pytest.param(
+        _extra_ablation,
+        f"ablation covers ['cnn_ae', 'iforest', 'zscore'], a full run covers "
+        f"{sorted(FEATURE_MODELS)}",
+        id="ablation-extra",
+    ),
+    pytest.param(
+        _labels_read,
+        "headline.label_reads_at_selection is 3, not 0: a test label was read before the headline "
+        "was chosen",
+        id="label-reads",
+    ),
+    pytest.param(
+        _wrong_headline,
+        "headline.model is 'zscore' but 'cnn_ae' has the highest validation objective",
+        id="headline-not-the-argmax",
+    ),
+]
+
+
+def test_a_full_run_has_no_publishable_problems():
+    assert publishable_problems(tiny_metrics()) == []
+
+
+@pytest.mark.parametrize(("break_it", "problem"), PUBLISHABLE_PROBLEMS)
+def test_each_unpublishable_condition_is_named_alone(break_it, problem):
+    assert publishable_problems(break_it(tiny_metrics())) == [problem]
+
+
+def test_every_problem_is_listed():
+    metrics = tiny_metrics()
+    for break_it in (_smoke_profile, _two_entities, _one_ablation, _labels_read):
+        metrics = break_it(metrics)
+    assert len(publishable_problems(metrics)) == 4
+
+
+# the argmax rule is also a validation error, so a file that breaks it cannot reach check_claims
+FILE_PROBLEMS = [param for param in PUBLISHABLE_PROBLEMS if param.id != "headline-not-the-argmax"]
+
+
+@pytest.mark.parametrize(("break_it", "problem"), FILE_PROBLEMS)
+def test_write_claims_refuses_an_unpublishable_run_and_writes_nothing(repo, break_it, problem):
+    write_metrics(repo / "reports" / "metrics.json", break_it(tiny_metrics()))
+    with pytest.raises(ValueError, match="not publishable") as raised:
+        write_claims(repo)
+    assert problem in str(raised.value)
+    assert not (repo / "reports" / "claims.json").exists()
+    assert (repo / "README.md").read_text() == README_TEXT
+
+
+@pytest.mark.parametrize(("break_it", "problem"), FILE_PROBLEMS)
+def test_check_claims_names_an_unpublishable_run(repo, break_it, problem):
+    write_metrics(repo / "reports" / "metrics.json", break_it(tiny_metrics()))
+    assert check_claims(repo) == [f"reports/metrics.json: not publishable: {problem}"]
+
+
+def test_check_claims_gives_one_message_per_problem(repo):
+    metrics = tiny_metrics()
+    for break_it in (_smoke_profile, _two_entities, _labels_read):
+        metrics = break_it(metrics)
+    write_metrics(repo / "reports" / "metrics.json", metrics)
+    messages = check_claims(repo)
+    assert len(messages) == 3
+    assert all(m.startswith("reports/metrics.json: not publishable: ") for m in messages)
+
+
+def test_a_published_file_that_is_not_the_best_model_is_invalid_not_publishable(repo):
+    write_metrics(repo / "reports" / "metrics.json", _wrong_headline(tiny_metrics()))
+    messages = check_claims(repo)
+    assert len(messages) == 1
+    assert messages[0].startswith("reports/metrics.json: invalid")
+    assert "highest validation objective" in messages[0]
 
 
 @pytest.mark.parametrize("module", [report_module, claims_module], ids=["report", "claims"])

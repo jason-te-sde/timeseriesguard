@@ -31,7 +31,12 @@ Around the tests:
   container and asserts a p95 below 50 ms over 2,000 requests. CI job `container`.
 - `uv run tsguard claims --check` compares the README block and `reports/claims.json` with the
   files in `reports/`. CI job `claims`, which enforces this only once `reports/` holds a `.json` or
-  `.csv` file; until then it prints `no reports/metrics.json yet` and passes.
+  `.csv` file; until then it prints `no reports/metrics.json yet` and passes. It also refuses a
+  `metrics.json` that is not a publishable run, with one message per problem: a profile other than
+  `full`, fewer than 28 entities, an ablation that does not cover both feature models, a nonzero
+  count of label reads at selection, or a headline that is not the model with the highest
+  validation objective. `tsguard claims --write` refuses the same runs, so a smoke run cannot
+  reach the README.
 - The `hygiene` job rejects a commit message that carries a `Co-Authored-By:` trailer.
 
 Gaps, stated so nobody assumes otherwise:
