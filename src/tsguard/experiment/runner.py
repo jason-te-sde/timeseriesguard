@@ -12,13 +12,15 @@ scores the frozen selection under every protocol.
 
 Pipeline fits and injected validation blocks are cached on the runner, because they depend on
 the entity, the fold and the seed but not on the model: a search over several models or
-hyper-parameters fits each fold's pipeline once.
+hyper-parameters fits each fold's pipeline once. The seed-keyed caches grow with every seed
+used; `EntityRunner.drop_seed_caches` forgets one seed's.
 """
 
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Final
 
@@ -33,6 +35,7 @@ from tsguard.data.splits import (
     chronological_split,
     walk_forward_folds,
 )
+from tsguard.errors import LeakageError
 from tsguard.eval.inject import InjectionConfig, inject, reference_sigma
 from tsguard.eval.protocols import (
     ProtocolName,
@@ -79,8 +82,9 @@ class RunConfig:
             the fold guard demands.
         protocol: The constants of the evaluation protocols.
         injection: How the synthetic validation anomalies are drawn.
-        causal_check: Whether `EntityRunner.select` runs the future-perturbation tests, once
-            per input kind.
+        causal_check: Whether `EntityRunner.select` runs the future-perturbation tests: the
+            feature transform and the fitting once per input kind, and each model's scoring
+            once per input kind.
         ae_epochs: Training epochs of the autoencoders.
         threads: Threads of the models that fit in parallel.
     """
@@ -129,7 +133,8 @@ class Selection:
         test_scores: One finite score per test row, read-only.
         digests: ``"pipeline"``, ``"detector"`` and ``"test_scores"`` digests of the last
             fold's fitted pipeline, its fitted detector and the test scores.
-        pipeline: The last fold's fitted pipeline; kept only when ``keep_models`` was set.
+        pipeline: The last fold's fitted pipeline; kept only when ``keep_models`` was set. It is
+            the runner's cached instance, which later selections share: do not refit it.
         detector: The last fold's fitted detector; kept only when ``keep_models`` was set.
     """
 
@@ -280,7 +285,7 @@ class EntityRunner:
         self._fits: dict[tuple[InputKind, Fold], tuple[FeaturePipeline, np.ndarray]] = {}
         self._injections: dict[tuple[int, Fold], tuple[np.ndarray, np.ndarray, int]] = {}
         self._validation_rows: dict[tuple[InputKind, Fold, int, int], np.ndarray] = {}
-        self._causal_checked: set[InputKind] = set()
+        self._causal_done: set[tuple[str, ...]] = set()
 
     @property
     def entity(self) -> str:
@@ -304,13 +309,15 @@ class EntityRunner:
             One outcome per fold.
 
         Raises:
-            LeakageError: A fold or feature guard fired.
+            LeakageError: A fold or feature guard fired; the error carries a note naming
+                the entity and the model.
             ValueError: ``model`` or ``params`` is not valid.
             RuntimeError: The model produced a non-finite validation score.
         """
         root = self._config.seed if seed is None else seed
-        plan = self._plan(model, params, root)
-        return tuple(run.outcome for run in self._run_folds(model, params, root, plan))
+        with self._annotated(model):
+            plan = self._plan(model, params, root)
+            return tuple(run.outcome for run in self._run_folds(model, params, root, plan))
 
     def select(
         self,
@@ -322,64 +329,46 @@ class EntityRunner:
     ) -> Selection:
         """Fit a configuration on the train rows, freeze its threshold, and score the test rows.
 
-        No test label is read. The threshold comes from the last fold's synthetic labels, and
-        the test rows are scored with the pipeline and detector of the last fold.
+        No test label is read. The whole call runs in the selection phase of the audit, even
+        inside an outer final-evaluation block, so a threshold search that reaches for the
+        labels is refused. The threshold comes from the last fold's synthetic labels, and the
+        test rows are scored with the pipeline and detector of the last fold.
 
         Args:
             model: Registry name of the model.
             params: Hyper-parameters of the model.
             seed: Root seed; the one in the run config if omitted.
-            keep_models: Keep the last fold's fitted pipeline and detector in the result.
+            keep_models: Keep the last fold's fitted pipeline and detector in the result. The
+                pipeline is the runner's cached instance, which later selections share, so it
+                must not be refitted.
 
         Returns:
             The selection.
 
         Raises:
-            LeakageError: The split, a fold, the feature pipeline or the threshold search
-                broke a leakage guard; the error's ``guard`` names it.
+            LeakageError: The split, a fold, the feature pipeline, a detector or the threshold
+                search broke a leakage guard; the error's ``guard`` names it and a note names
+                the entity and the model.
             ValueError: ``model`` or ``params`` is not valid.
             RuntimeError: The model produced a non-finite score.
         """
         root = self._config.seed if seed is None else seed
-        data, config = self._data, self._config
-        train_idx, test_idx = self._split_fn(data.train_end, data.n_test)
-        check_split_monotonic(train_idx, test_idx)
-        plan = self._plan(model, params, root)
-        runs = self._run_folds(model, params, root, plan)
-        last = runs[-1]
-        threshold = self._audit.freeze_threshold(
-            self._threshold_fn(last.scores, last.labels, config.protocol),
-            caller=f"select[{model}]",
-        )
-        context = last.detector.lookback - 1
-        full = data.full
-        rows = last.pipeline.transform(full, start_index=data.train_end, context=context)
-        test_scores = np.array(last.detector.score(rows, context=context), dtype=np.float64)
-        if not np.isfinite(test_scores).all():
-            raise RuntimeError(
-                f"{data.name}: model {model!r} produced {int((~np.isfinite(test_scores)).sum())} "
-                f"non-finite scores on the test rows"
-            )
-        _read_only(test_scores)
-        self._check_causal(plan, last, full, root)
-        folds = tuple(run.outcome for run in runs)
-        return Selection(
-            entity=data.name,
-            model=model,
-            params=dict(params),
-            seed=root,
-            folds=folds,
-            objective=float(np.mean([fold.objective for fold in folds])),
-            threshold=threshold,
-            test_scores=test_scores,
-            digests={
-                "pipeline": last.pipeline.state_digest(),
-                "detector": last.detector.state_digest(),
-                "test_scores": array_digest(test_scores),
-            },
-            pipeline=last.pipeline if keep_models else None,
-            detector=last.detector if keep_models else None,
-        )
+        with self._annotated(model), self._audit.phase(Phase.SELECTION):
+            return self._select(model, params, root, keep_models)
+
+    def drop_seed_caches(self, seed: int) -> None:
+        """Forget the injected validation blocks and rows cached for one seed.
+
+        The pipeline fits do not depend on the seed and stay. A run over several seeds on one
+        runner calls this after each seed: on a real entity a seed holds about 150 MB.
+
+        Args:
+            seed: The root seed whose caches to drop; a seed never used is ignored.
+        """
+        for key in [key for key in self._injections if key[0] == seed]:
+            del self._injections[key]
+        for validation_key in [key for key in self._validation_rows if key[2] == seed]:
+            del self._validation_rows[validation_key]
 
     def evaluate(self, selection: Selection) -> Evaluation:
         """Score a selection of this entity on its test labels.
@@ -400,6 +389,56 @@ class EntityRunner:
                 f"labels of entity {self.entity!r}"
             )
         return evaluate_selection(selection, self._data.labels, self._audit, self._config.protocol)
+
+    @contextmanager
+    def _annotated(self, model: str) -> Iterator[None]:
+        """Add the entity and the model to the notes of any leakage error raised inside."""
+        try:
+            yield
+        except LeakageError as error:
+            error.add_note(f"entity {self._data.name}, model {model}")
+            raise
+
+    def _select(self, model: str, params: Params, seed: int, keep_models: bool) -> Selection:
+        data, config = self._data, self._config
+        train_idx, test_idx = self._split_fn(data.train_end, data.n_test)
+        check_split_monotonic(train_idx, test_idx)
+        plan = self._plan(model, params, seed)
+        runs = self._run_folds(model, params, seed, plan)
+        last = runs[-1]
+        threshold = self._audit.freeze_threshold(
+            self._threshold_fn(last.scores, last.labels, config.protocol),
+            caller=f"select[{model}]",
+        )
+        context = last.detector.lookback - 1
+        full = data.full
+        rows = last.pipeline.transform(full, start_index=data.train_end, context=context)
+        test_scores = np.array(last.detector.score(rows, context=context), dtype=np.float64)
+        if not np.isfinite(test_scores).all():
+            raise RuntimeError(
+                f"{data.name}: model {model!r} produced {int((~np.isfinite(test_scores)).sum())} "
+                f"non-finite scores on the test rows"
+            )
+        _read_only(test_scores)
+        self._check_causal(model, plan, last, full, rows, seed)
+        folds = tuple(run.outcome for run in runs)
+        return Selection(
+            entity=data.name,
+            model=model,
+            params=dict(params),
+            seed=seed,
+            folds=folds,
+            objective=float(np.mean([fold.objective for fold in folds])),
+            threshold=threshold,
+            test_scores=test_scores,
+            digests={
+                "pipeline": last.pipeline.state_digest(),
+                "detector": last.detector.state_digest(),
+                "test_scores": array_digest(test_scores),
+            },
+            pipeline=last.pipeline if keep_models else None,
+            detector=last.detector if keep_models else None,
+        )
 
     def _default_folds(self, n: int) -> tuple[Fold, ...]:
         config = self._config
@@ -504,37 +543,55 @@ class EntityRunner:
             )
         return runs
 
-    def _check_causal(self, plan: _Plan, last: _FoldRun, full: np.ndarray, seed: int) -> None:
-        """Run the two future-perturbation tests once per input kind, on the last fold.
+    def _check_causal(
+        self,
+        model: str,
+        plan: _Plan,
+        last: _FoldRun,
+        full: np.ndarray,
+        test_rows: np.ndarray,
+        seed: int,
+    ) -> None:
+        """Run the future-perturbation tests that have not run yet for this model.
 
-        Evaluation must not read rows after the one it scores, and fitting on the fit rows
-        must not depend on the rows after them.
+        Per input kind, once: the pipeline's transform of the test rows must not read later
+        rows, and its fit on the fit rows must not depend on the rows after them. Per input
+        kind and model, once: the detector's scores over the standardized test rows must not
+        read later rows. The last two do not recompute any feature.
         """
-        if not self._config.causal_check or plan.kind in self._causal_checked:
+        if not self._config.causal_check:
             return
-        data, detector, pipeline = self._data, last.detector, last.pipeline
-        context = detector.lookback - 1
-
-        def test_scores(X: np.ndarray) -> np.ndarray:
-            rows = pipeline.transform(X, start_index=data.train_end, context=context)
-            return detector.score(rows, context=context)
-
-        def fit_digest(X: np.ndarray) -> str:
-            fitted = self._pipeline_factory(plan.specs).fit(X, end_index=last.fold.fit_end)
-            return fitted.state_digest()
-
+        data, kind, pipeline, detector = self._data, plan.kind, last.pipeline, last.detector
         label = (seed, data.name, "causal")
-        assert_causal(
-            test_scores,
-            full,
-            t0=data.train_end + data.n_test // 2,
-            start=data.train_end,
-            rng=np.random.default_rng(derive_seed(*label)),
-        )
-        assert_fit_ignores_future(
-            fit_digest,
-            full,
-            end_index=last.fold.fit_end,
-            rng=np.random.default_rng(derive_seed(*label)),
-        )
-        self._causal_checked.add(plan.kind)
+        if ("transform", kind) not in self._causal_done:
+            assert_causal(
+                lambda X: pipeline.transform(X, start_index=data.train_end),
+                full,
+                t0=data.train_end + data.n_test // 2,
+                start=data.train_end,
+                rng=np.random.default_rng(derive_seed(*label)),
+            )
+            self._causal_done.add(("transform", kind))
+        if ("fit", kind) not in self._causal_done:
+
+            def fit_digest(X: np.ndarray) -> str:
+                fitted = self._pipeline_factory(plan.specs).fit(X, end_index=last.fold.fit_end)
+                return fitted.state_digest()
+
+            assert_fit_ignores_future(
+                fit_digest,
+                full,
+                end_index=last.fold.fit_end,
+                rng=np.random.default_rng(derive_seed(*label)),
+            )
+            self._causal_done.add(("fit", kind))
+        if ("score", kind, model) not in self._causal_done:
+            context = detector.lookback - 1
+            assert_causal(
+                lambda X: detector.score(X, context=context),
+                test_rows,
+                t0=context + data.n_test // 2,
+                start=context,
+                rng=np.random.default_rng(derive_seed(*label, model)),
+            )
+            self._causal_done.add(("score", kind, model))

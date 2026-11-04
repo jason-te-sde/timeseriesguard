@@ -2,15 +2,18 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import pytest
 import torch
 
 from tests.conftest import make_entity
-from tsguard.data.labels import FrozenThreshold, LabelAudit
+from tsguard.data.labels import FrozenThreshold, LabelAudit, Phase
 from tsguard.data.smd import EntityData
-from tsguard.eval.protocols import PROTOCOLS
+from tsguard.data.splits import Fold, walk_forward_folds
+from tsguard.eval.inject import InjectionConfig, inject, reference_sigma
+from tsguard.eval.protocols import PROTOCOLS, ProtocolParams, event_level_auc_pr, select_threshold
 from tsguard.experiment.runner import (
     SENSITIVITY_GRID,
     EntityRunner,
@@ -20,8 +23,10 @@ from tsguard.experiment.runner import (
 )
 from tsguard.features.pipeline import FeaturePipeline
 from tsguard.features.specs import FeatureSpec
+from tsguard.models import build_detector
+from tsguard.models.base import Detector
 from tsguard.models.space import DEFAULT_PARAMS
-from tsguard.repro.seeding import configure_runtime
+from tsguard.repro.seeding import configure_runtime, derive_seed
 
 N_TRAIN = 3000
 N_TEST = 2000
@@ -242,3 +247,187 @@ def test_non_finite_scores_name_the_entity_and_model(monkeypatch, nan_when_rows,
     runner = build_world(RunConfig(causal_check=False)).runner
     with pytest.raises(RuntimeError, match=rf"synthetic-0.*'zscore'.*{where}"):
         runner.select("zscore", ZSCORE)
+
+
+@dataclass
+class ThresholdCall:
+    scores: np.ndarray
+    labels: np.ndarray
+    phase: Phase
+
+
+def spying_world(*, causal_check: bool = True) -> tuple[World, list[ThresholdCall]]:
+    """Build a world whose threshold search records what it was given and the phase it ran in."""
+    calls: list[ThresholdCall] = []
+    audit = LabelAudit()
+
+    def spy(scores: np.ndarray, labels: np.ndarray, params: ProtocolParams) -> float:
+        calls.append(ThresholdCall(scores.copy(), labels.copy(), audit.current))
+        return select_threshold(scores, labels, params)
+
+    data = make_entity(n_train=N_TRAIN, n_test=N_TEST, audit=audit)
+    runner = EntityRunner(
+        data,
+        audit,
+        RunConfig(ae_epochs=1, threads=1, causal_check=causal_check),
+        threshold_fn=spy,
+    )
+    return World(data, audit, runner), calls
+
+
+def injected_labels(data: EntityData, fold: Fold, seed: int = 0) -> np.ndarray:
+    """Re-derive the synthetic labels of a fold's validation block from the documented seeds."""
+    train = data.train
+    _, labels, _ = inject(
+        train[: fold.val_end],
+        start=fold.val_start,
+        end=fold.val_end,
+        sigma=reference_sigma(train[: fold.fit_end]),
+        rng=np.random.default_rng(derive_seed(seed, data.name, "inject", fold.index)),
+        config=InjectionConfig(),
+    )
+    return labels
+
+
+def test_threshold_is_chosen_from_the_last_fold_block():
+    spied, calls = spying_world(causal_check=False)
+    selection = spied.runner.select("zscore", ZSCORE)
+    folds = walk_forward_folds(N_TRAIN)
+    (call,) = calls
+    # Three different objectives, so equality with the last one cannot hold for another fold.
+    assert len({fold.objective for fold in selection.folds}) == 3
+    assert event_level_auc_pr(call.scores, call.labels, CONFIG.protocol) == (
+        selection.folds[-1].objective
+    )
+    assert np.array_equal(call.labels, injected_labels(spied.data, folds[-1]))
+    assert not np.array_equal(call.labels, injected_labels(spied.data, folds[0]))
+    assert len(call.scores) == folds[-1].val_end - folds[-1].val_start
+
+
+@pytest.mark.parametrize(("model", "params"), [("zscore", ZSCORE), ("cnn_ae", CNN_AE)])
+def test_test_scores_come_from_the_kept_last_fold_models(world, model, params):
+    kept = world.runner.select(model, params, keep_models=True)
+    assert kept.pipeline is not None
+    assert kept.detector is not None
+    assert kept.pipeline.fit_end == LAST_FIT_END
+    context = kept.detector.lookback - 1
+    rows = kept.pipeline.transform(world.data.full, start_index=N_TRAIN, context=context)
+    rescored = kept.detector.score(rows, context=context)
+    assert rescored.tobytes() == kept.test_scores.tobytes()
+
+
+def fresh_runner() -> EntityRunner:
+    return build_world(RunConfig(ae_epochs=1, threads=1, causal_check=False)).runner
+
+
+def assert_same_selection(warm: Selection, fresh: Selection) -> None:
+    assert warm.digests == fresh.digests
+    assert warm.objective == fresh.objective
+    assert warm.folds == fresh.folds
+    assert warm.threshold.value == fresh.threshold.value
+    assert warm.test_scores.tobytes() == fresh.test_scores.tobytes()
+
+
+def test_a_warm_runner_selects_a_new_seed_like_a_fresh_one(world, zscore):
+    warm = world.runner.select("zscore", ZSCORE, seed=1)
+    assert_same_selection(warm, fresh_runner().select("zscore", ZSCORE, seed=1))
+
+
+def test_a_warm_runner_selects_a_new_window_like_a_fresh_one(world):
+    world.runner.select("cnn_ae", CNN_AE)
+    wider = {**CNN_AE, "window": 32}
+    warm = world.runner.select("cnn_ae", wider)
+    assert_same_selection(warm, fresh_runner().select("cnn_ae", wider))
+
+
+class TrackedDetector:
+    """Wraps a detector and records how many rows each ``score`` call returned."""
+
+    def __init__(self, inner: Detector, scored: list[int]) -> None:
+        self._inner = inner
+        self._scored = scored
+        self.name = inner.name
+        self.input_kind = inner.input_kind
+        self.lookback = inner.lookback
+
+    def fit(self, X: np.ndarray) -> None:
+        self._inner.fit(X)
+
+    def score(self, X: np.ndarray, *, context: int) -> np.ndarray:
+        scores = self._inner.score(X, context=context)
+        self._scored.append(len(scores))
+        return scores
+
+    def state_digest(self) -> str:
+        return self._inner.state_digest()
+
+
+def test_causal_checks_run_once_per_input_kind_and_once_per_model(monkeypatch):
+    full_rows: list[int] = []
+    scored: list[int] = []
+
+    class Tracked(FeaturePipeline):
+        def transform(
+            self, X: np.ndarray, *, start_index: int, context: int = 0, offset: int = 0
+        ) -> np.ndarray:
+            full_rows.append(len(X))
+            return super().transform(X, start_index=start_index, context=context, offset=offset)
+
+    monkeypatch.setattr(
+        "tsguard.experiment.runner.build_detector",
+        lambda *a, **k: TrackedDetector(build_detector(*a, **k), scored),
+    )
+
+    def count() -> tuple[int, int]:
+        return full_rows.count(N_TRAIN + N_TEST), scored.count(N_TEST)
+
+    runner = build_world(pipeline_factory=lambda specs: Tracked(specs)).runner
+    runner.select("zscore", ZSCORE)
+    # The test rows are transformed and scored once; each causal check does it twice more.
+    assert count() == (3, 3)
+    runner.select("zscore", {"aggregation": "mean", "k": 8})
+    assert count() == (4, 4)  # same kind and same model: only the test rows
+    runner.select("iforest", {"n_estimators": 20, "max_samples": 256})
+    assert count() == (5, 7)  # same kind, new model: its own score check only
+
+
+def test_select_runs_in_the_selection_phase_inside_an_outer_block():
+    spied, calls = spying_world(causal_check=False)
+    with spied.audit.phase(Phase.FINAL_EVALUATION):
+        spied.runner.select("zscore", ZSCORE)
+        assert spied.audit.current is Phase.FINAL_EVALUATION
+    assert [call.phase for call in calls] == [Phase.SELECTION]
+    assert spied.audit.reads == 0
+
+
+def test_drop_seed_caches_forgets_one_seed_only(monkeypatch):
+    injected: list[int] = []
+    validation_rows: list[int] = []
+
+    def counting_inject(*args: Any, **kwargs: Any) -> Any:
+        injected.append(1)
+        return inject(*args, **kwargs)
+
+    class Tracked(FeaturePipeline):
+        def transform(
+            self, X: np.ndarray, *, start_index: int, context: int = 0, offset: int = 0
+        ) -> np.ndarray:
+            if len(X) <= N_TRAIN:  # a validation block, not the test rows
+                validation_rows.append(len(X))
+            return super().transform(X, start_index=start_index, context=context, offset=offset)
+
+    monkeypatch.setattr("tsguard.experiment.runner.inject", counting_inject)
+    config = RunConfig(ae_epochs=1, threads=1, causal_check=False)
+    runner = build_world(config, pipeline_factory=lambda specs: Tracked(specs)).runner
+    first = runner.select("zscore", ZSCORE, seed=1)
+    runner.select("zscore", ZSCORE, seed=2)
+    assert (len(injected), len(validation_rows)) == (6, 6)
+    runner.select("zscore", ZSCORE, seed=1)
+    assert (len(injected), len(validation_rows)) == (6, 6)  # cached
+    runner.drop_seed_caches(1)
+    runner.drop_seed_caches(99)  # a seed that was never used is not an error
+    again = runner.select("zscore", ZSCORE, seed=1)
+    assert (len(injected), len(validation_rows)) == (9, 9)  # seed 1 was rebuilt
+    runner.select("zscore", ZSCORE, seed=2)
+    assert (len(injected), len(validation_rows)) == (9, 9)  # seed 2 was kept
+    assert_same_selection(again, first)
