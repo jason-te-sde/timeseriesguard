@@ -172,7 +172,7 @@ jobs:
       - name: Reproduce the smoke profile
         run: uv run tsguard reproduce --profile smoke --out artifacts/smoke --tracking-uri sqlite:///artifacts/mlruns.db
       - name: Slow tests
-        run: uv run pytest -m slow -v
+        run: uv run pytest -m slow -v --ignore=tests/determinism
       - name: Keep the smoke artifacts
         if: always()
         uses: actions/upload-artifact@v7
@@ -181,6 +181,41 @@ jobs:
           path: artifacts/
           if-no-files-found: warn
           retention-days: 7
+
+  determinism:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      UV_PYTHON: "3.11"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.12.19"
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --all-extras --group dev --python 3.11 --locked
+      - name: Restore the SMD cache (read only)
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/tsguard
+          key: smd-${{ hashFiles('src/tsguard/data/smd_manifest.json') }}
+      - name: Fetch the determinism entity (a no-op on a warm cache)
+        run: |
+          # The fetch is idempotent, so a transient failure (for example a 429 from
+          # raw.githubusercontent.com) is retried instead of turning the job red.
+          for attempt in 1 2 3; do
+            if uv run tsguard data fetch --entities machine-1-1; then
+              exit 0
+            fi
+            echo "::warning::data fetch attempt ${attempt} of 3 failed"
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 15))
+            fi
+          done
+          exit 1
+      - name: Same seed, same bytes
+        run: uv run pytest tests/determinism -m "slow or data" -v
 
   claims:
     runs-on: ubuntu-latest
