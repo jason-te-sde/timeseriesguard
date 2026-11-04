@@ -35,6 +35,7 @@ from tsguard.errors import (
     GUARD_FOLD,
     GUARD_LABELS,
     GUARD_SPLIT,
+    LeakageError,
 )
 from tsguard.features.causality import assert_causal, assert_fit_ignores_future
 from tsguard.features.pipeline import FeaturePipeline
@@ -65,6 +66,11 @@ EXPECTED_GUARDS = {
 """The spec's table: which guard must catch which defect."""
 
 
+def guard_of(defect_id: str) -> str:
+    """Return the guard `DEFECTS` names for a defect, so a test cannot assert another's."""
+    return DEFECTS[defect_id][1]
+
+
 def covers(*defect_ids: str) -> Callable[[_Test], _Test]:
     """Record on a test which defects it injects, for `test_every_defect_has_a_test`."""
 
@@ -77,10 +83,13 @@ def covers(*defect_ids: str) -> Callable[[_Test], _Test]:
 
 @covers(*FEATURE_DEFECTS)
 @pytest.mark.parametrize(
-    "spec",
-    [pytest.param(spec, id=f"{ident}-{spec.name}") for ident, spec in FEATURE_DEFECTS.items()],
+    ("ident", "spec"),
+    [
+        pytest.param(ident, spec, id=f"{ident}-{spec.name}")
+        for ident, spec in FEATURE_DEFECTS.items()
+    ],
 )
-def test_feature_defect_is_caught_by_assert_causal(spec, rng):
+def test_feature_defect_is_caught_by_assert_causal(ident, spec, rng):
     e = make_entity()
     p = FeaturePipeline((*FEATURE_SPECS[:3], spec)).fit(e.full, end_index=e.train_end)
     caught = caught_by(
@@ -92,7 +101,7 @@ def test_feature_defect_is_caught_by_assert_causal(spec, rng):
             rng=rng,
         )
     )
-    assert caught == GUARD_CAUSAL
+    assert caught == guard_of(ident)
 
 
 @covers("2")
@@ -100,9 +109,9 @@ def test_full_fit_scaler_is_caught_by_fit_end_guard():
     e = make_entity()
     p = FullFitPipeline().fit(e.full, end_index=e.train_end)
     assert p.fit_end == len(e.full)
-    assert caught_by(lambda: p.transform(e.full, start_index=e.train_end)) == GUARD_FIT_END
+    assert caught_by(lambda: p.transform(e.full, start_index=e.train_end)) == guard_of("2")
     # The last row the scaler saw is refused too, so an off-by-one in the guard cannot pass.
-    assert caught_by(lambda: p.transform(e.full, start_index=len(e.full) - 1)) == GUARD_FIT_END
+    assert caught_by(lambda: p.transform(e.full, start_index=len(e.full) - 1)) == guard_of("2")
 
 
 @covers("2")
@@ -111,7 +120,7 @@ def test_full_fit_through_fit_transform_is_caught_by_fit_end_guard():
     p = FullFitPipeline()
     in_sample = p.fit_transform(e.full, end_index=e.train_end)
     assert len(in_sample) == len(e.full)
-    assert caught_by(lambda: p.transform(e.full, start_index=e.train_end)) == GUARD_FIT_END
+    assert caught_by(lambda: p.transform(e.full, start_index=e.train_end)) == guard_of("2")
 
 
 @covers("2b")
@@ -129,7 +138,7 @@ def test_lying_scaler_is_caught_by_fit_side_perturbation(rng):
             rng=rng,
         )
     )
-    assert caught == GUARD_CAUSAL
+    assert caught == guard_of("2b")
 
 
 @covers("2b")
@@ -142,16 +151,16 @@ def test_lying_scaler_through_fit_transform_is_caught_by_fit_side_perturbation(r
         assert len(in_sample) == e.train_end
         return p.state_digest()
 
-    assert (
-        caught_by(lambda: assert_fit_ignores_future(digest, e.full, end_index=e.train_end, rng=rng))
-        == GUARD_CAUSAL
-    )
+    assert caught_by(
+        lambda: assert_fit_ignores_future(digest, e.full, end_index=e.train_end, rng=rng)
+    ) == guard_of("2b")
 
 
 @covers("5")
 def test_threshold_chosen_on_test_labels_is_caught_by_label_audit():
     e = make_entity()  # a fresh audit starts in the selection phase
-    assert caught_by(lambda: e.labels.read("threshold_search")) == GUARD_LABELS
+    assert caught_by(lambda: e.labels.read("threshold_search")) == guard_of("5")
+    assert e.labels.audit.reads == 0  # a refused read is not logged as a read
 
 
 @covers("5b")
@@ -164,7 +173,7 @@ def test_threshold_chosen_during_final_evaluation_is_caught_by_label_audit():
             best = float(np.quantile(e.labels.read("pick"), 0.5))
             return audit.freeze_threshold(best, caller="pick_on_test")
 
-    assert caught_by(pick_on_test) == GUARD_LABELS
+    assert caught_by(pick_on_test) == guard_of("5b")
     assert audit.current is Phase.SELECTION
     assert audit.reads == 1  # the read itself was legal; freezing a threshold afterwards was not
 
@@ -172,7 +181,12 @@ def test_threshold_chosen_during_final_evaluation_is_caught_by_label_audit():
 @covers("6")
 def test_folds_without_purge_are_caught_by_fold_boundary_check():
     folds = walk_forward_folds(2000, purge=0)
-    assert caught_by(lambda: check_fold_boundaries(folds, lookback=64)) == GUARD_FOLD
+    with pytest.raises(LeakageError) as caught:
+        check_fold_boundaries(folds, lookback=64, purge=64)
+    assert caught.value.guard == guard_of("6")
+    # The first fold is at fault, with no row between its fit window and its validation window.
+    assert caught.value.detail["fold"] == 1
+    assert caught.value.detail["gap"] == 0
 
 
 @covers("7")
@@ -182,7 +196,7 @@ def test_shuffled_split_is_caught_by_split_monotonic_check(rng):
     assert tr.dtype == te.dtype == np.int64
     assert np.all(np.diff(tr) > 0)
     assert np.all(np.diff(te) > 0)
-    assert caught_by(lambda: check_split_monotonic(tr, te)) == GUARD_SPLIT
+    assert caught_by(lambda: check_split_monotonic(tr, te)) == guard_of("7")
 
 
 def test_every_defect_has_a_test():

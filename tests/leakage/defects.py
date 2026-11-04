@@ -8,6 +8,11 @@ leak shows on every row of a block that has rows after it. None of them returns 
 pipeline refuses a NaN past a spec's warmup (and these specs claim a lookback of 1, so they
 have none), and a refusal would hide the leak from the guard that is meant to catch it.
 
+Each defect must be caught for the leak it names and for no other. The two fill defects
+therefore open their gaps with a mask that reads only the value itself (``block > 0.5``),
+never a statistic of the block: with a block median as the mask, `assert_causal` would fire
+on the median, and a forward fill behind the same mask would be flagged just the same.
+
 The pipeline defects subclass `FeaturePipeline` and break the one rule it exists to keep:
 the standardization is fitted on the rows before ``end_index`` and on nothing else.
 """
@@ -55,9 +60,23 @@ def _defect_spec(name: str, fn: Callable[[np.ndarray, BlockCache], np.ndarray]) 
     return FeatureSpec(f"defect_{name}", DEFECT_FAMILY, 1, "channel", fn)
 
 
-def _above_median(block: np.ndarray) -> np.ndarray:
-    """Return a mask of the values above their column's median over the whole block."""
-    return np.asarray(block > np.median(block, axis=0))
+GAP_LEVEL: Final = 0.5
+"""The fill defects treat every value at or below this level as a gap."""
+
+
+def gaps(block: np.ndarray) -> pd.DataFrame:
+    """Return ``block`` with every value at or below `GAP_LEVEL` replaced by NaN.
+
+    The mask reads each value on its own, so it is causal: the only thing that can make a
+    fill built on it leak is the direction it fills in.
+
+    Args:
+        block: Channel values ``(m, c)``.
+
+    Returns:
+        A frame of the same shape; roughly half the cells of an SMD-like block are gaps.
+    """
+    return pd.DataFrame(block).where(block > GAP_LEVEL)
 
 
 def _centered_rolling(block: np.ndarray, cache: BlockCache) -> np.ndarray:
@@ -66,7 +85,7 @@ def _centered_rolling(block: np.ndarray, cache: BlockCache) -> np.ndarray:
 
 
 def _bfill(block: np.ndarray, cache: BlockCache) -> np.ndarray:
-    filled = pd.DataFrame(block).where(_above_median(block)).bfill().fillna(0.0)
+    filled = gaps(block).bfill().fillna(0.0)
     return np.asarray(filled.to_numpy(dtype=np.float64))
 
 
@@ -77,8 +96,7 @@ def _whole_series_fft(block: np.ndarray, cache: BlockCache) -> np.ndarray:
 
 
 def _interpolate_both(block: np.ndarray, cache: BlockCache) -> np.ndarray:
-    gaps = pd.DataFrame(block).where(_above_median(block))
-    filled = gaps.interpolate(limit_direction="both").fillna(0.0)
+    filled = gaps(block).interpolate(limit_direction="both").fillna(0.0)
     return np.asarray(filled.to_numpy(dtype=np.float64))
 
 
@@ -86,7 +104,7 @@ CENTERED_ROLLING: Final = _defect_spec("centered_rolling", _centered_rolling)
 """Defect 1: a 5-row rolling mean centered on the row, which reads two rows ahead."""
 
 BFILL: Final = _defect_spec("bfill", _bfill)
-"""Defect 3: gaps (the values below the column median) filled from the next value, backwards."""
+"""Defect 3: gaps (the values at or below `GAP_LEVEL`) filled from the next value, backwards."""
 
 WHOLE_SERIES_FFT: Final = _defect_spec("whole_series_fft", _whole_series_fft)
 """Defect 4: the dominant spectral magnitude of the entire block, the same on every row."""
@@ -192,12 +210,12 @@ DEFECTS: Final[dict[str, tuple[str, str]]] = {
     "1": ("rolling window centered on the row, reading rows after it", GUARD_CAUSAL),
     "2": ("scaler fitted on every row and recorded as such", GUARD_FIT_END),
     "2b": ("scaler fitted on every row but recorded with the requested fit end", GUARD_CAUSAL),
-    "3": ("gaps filled from the next value, backwards", GUARD_CAUSAL),
+    "3": ("gaps (values at or below 0.5) filled from the next value, backwards", GUARD_CAUSAL),
     "4": ("spectrum computed over the whole block instead of a trailing window", GUARD_CAUSAL),
     "5": ("threshold searched on test labels during model selection", GUARD_LABELS),
     "5b": ("threshold frozen after test labels were read during evaluation", GUARD_LABELS),
     "6": ("walk-forward folds without a purge between fit and validation", GUARD_FOLD),
     "7": ("rows shuffled into train and test, ignoring time order", GUARD_SPLIT),
-    "8": ("gaps filled by interpolating in both directions", GUARD_CAUSAL),
+    "8": ("gaps (values at or below 0.5) interpolated from both sides", GUARD_CAUSAL),
 }
 """Every injected defect: its id, a description, and the guard that must catch it."""

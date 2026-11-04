@@ -10,9 +10,10 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import numpy as np
+import pandas as pd
 
 from tests.conftest import make_entity
-from tests.leakage.defects import caught_by
+from tests.leakage.defects import GAP_LEVEL, caught_by
 from tsguard.data.smd import EntityData
 from tsguard.features.causality import assert_causal, assert_fit_ignores_future
 from tsguard.features.pipeline import FeaturePipeline
@@ -29,6 +30,21 @@ def expanding_mean_spec() -> FeatureSpec:
         return np.asarray(np.cumsum(block, axis=0) / counts)
 
     return FeatureSpec("expanding_mean", "expanding", MAX_LOOKBACK, "channel", fn)
+
+
+def forward_fill_spec() -> FeatureSpec:
+    """The twin of the backward-fill defect: the same gaps, filled from the value before them.
+
+    The mask is `GAP_LEVEL`, which reads each value on its own, so the fill direction is
+    the only difference from `BFILL`. A fill that reads only earlier rows is causal, so this
+    must come back clean; if it were flagged, the defect would be caught for its mask.
+    """
+
+    def fn(block: np.ndarray, cache: BlockCache) -> np.ndarray:
+        filled = pd.DataFrame(block).where(block > GAP_LEVEL).ffill().fillna(0.0)
+        return np.asarray(filled.to_numpy(dtype=np.float64))
+
+    return FeatureSpec("ffill_gaps", "fill", MAX_LOOKBACK, "channel", fn)
 
 
 def flagged_by(
@@ -78,6 +94,11 @@ def test_trailing_and_expanding_windows_are_not_flagged(rng):
     assert (
         caught_by(lambda: assert_causal(expanding_mean_of_series, e.full, t0=1000, rng=rng)) is None
     )
+
+
+def test_gaps_filled_forward_are_not_flagged(rng):
+    specs = (*FEATURE_SPECS[:3], forward_fill_spec())
+    assert flagged_by(specs, make_entity(), rng) is None
 
 
 def test_entities_are_independent(rng):
