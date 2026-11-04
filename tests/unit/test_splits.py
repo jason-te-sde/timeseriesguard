@@ -105,6 +105,50 @@ def test_fold_detail_values_are_plain_ints():
     assert all(type(value) is int for value in ei.value.detail.values())
 
 
+@pytest.mark.parametrize("field", ["fit_end", "val_start", "val_end"])
+@pytest.mark.parametrize("bad", [564.0, float("nan")])
+def test_a_fold_field_that_is_not_an_integer_is_a_type_error_naming_the_fold(field, bad):
+    good = {"index": 2, "fit_end": 667, "val_start": 731, "val_end": 833}
+    folds = (Fold(1, 500, 564, 667), Fold(**{**good, field: bad}))
+    with pytest.raises(TypeError, match=rf"fold 2: {field} must be an integer, got float"):
+        check_fold_boundaries(folds, lookback=64)
+
+
+def test_a_fold_index_that_is_not_an_integer_is_a_type_error():
+    folds = (Fold(2.0, 500, 564, 667),)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match=r"fold 2\.0: index must be an integer"):
+        check_fold_boundaries(folds, lookback=64)
+
+
+def test_a_nan_fit_end_no_longer_slips_through_the_gap_comparisons():
+    folds = (Fold(1, float("nan"), 564, 667),)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match=r"fold 1: fit_end must be an integer, got float nan"):
+        check_fold_boundaries(folds, lookback=64)
+
+
+def test_numpy_integers_are_accepted_and_reported_as_plain_ints():
+    folds = (
+        Fold(np.int64(1), np.int64(500), np.int64(564), np.int64(667)),  # type: ignore[arg-type]
+        Fold(np.int64(2), np.int64(667), np.int64(700), np.int64(833)),  # type: ignore[arg-type]
+    )
+    with pytest.raises(FoldBoundaryError) as ei:
+        check_fold_boundaries(folds, lookback=64)
+    assert ei.value.detail == {"fold": 2, "gap": 33, "purge": 64}
+    assert all(type(value) is int for value in ei.value.detail.values())
+
+
+@pytest.mark.parametrize("fit_end", [0, -5])
+def test_a_fold_that_fits_on_no_rows_is_rejected(fit_end):
+    folds = (Fold(1, fit_end, fit_end + 64, fit_end + 164),)
+    with pytest.raises(FoldBoundaryError, match=r"fold 1: the fit window") as ei:
+        check_fold_boundaries(folds, lookback=64)
+    assert ei.value.detail == {"fold": 1, "gap": 64, "purge": 64}
+
+
+def test_a_fit_window_of_one_row_is_accepted():
+    check_fold_boundaries((Fold(1, 1, 65, 100),), lookback=64)
+
+
 def test_lookback_below_one_is_a_value_error():
     with pytest.raises(ValueError, match="lookback"):
         check_fold_boundaries(walk_forward_folds(1000, purge=0), lookback=0, purge=0)

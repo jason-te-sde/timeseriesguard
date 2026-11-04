@@ -17,8 +17,9 @@ the fold or the index that breaks them.
 from __future__ import annotations
 
 import math
+import operator
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import numpy as np
 
@@ -89,11 +90,14 @@ def walk_forward_folds(
 def check_fold_boundaries(folds: Sequence[Fold], *, lookback: int, purge: int = 64) -> None:
     """Check that no fold fits on rows its features or its neighbours validate on.
 
-    Per fold, in order: ``val_start - fit_end`` must be at least ``purge`` and the
-    validation window must hold at least one row. Between a fold and the next, ``fit_end``,
-    ``val_start`` and ``val_end`` must each strictly increase, and ``val_end`` must not
-    exceed the next fold's ``fit_end`` (equality is fine: the next fold may fit on exactly
-    the rows this one validated on, but not validate on rows it has already trained past).
+    Every field of every fold must be an integer (`operator.index` accepts ``int`` and numpy
+    integers, and refuses ``float``, so a NaN boundary cannot pass the comparisons below).
+    Per fold, in order: the fit window must hold at least one row, ``val_start - fit_end``
+    must be at least ``purge`` and the validation window must hold at least one row. Between
+    a fold and the next, ``fit_end``, ``val_start`` and ``val_end`` must each strictly
+    increase, and ``val_end`` must not exceed the next fold's ``fit_end`` (equality is fine:
+    the next fold may fit on exactly the rows this one validated on, but not validate on rows
+    it has already trained past).
 
     Args:
         folds: The folds to check, in time order.
@@ -103,6 +107,8 @@ def check_fold_boundaries(folds: Sequence[Fold], *, lookback: int, purge: int = 
 
     Raises:
         ValueError: ``lookback`` is below 1.
+        TypeError: A field of a fold is not an integer; the message names the fold and the
+            field.
         FoldBoundaryError: A rule above is violated. The message names the fold and the gap;
             ``detail`` holds the plain integers ``fold``, ``gap`` and ``purge``. ``gap`` is
             the offending distance in rows: ``val_start - fit_end`` for the per-fold rules,
@@ -124,15 +130,37 @@ def check_fold_boundaries(folds: Sequence[Fold], *, lookback: int, purge: int = 
             detail={"fold": 0, "gap": 0, "purge": purge},
         )
     previous: Fold | None = None
-    for fold in folds:
+    for fold in (_as_integers(fold) for fold in folds):
         _check_one_fold(fold, purge)
         if previous is not None:
             _check_fold_pair(previous, fold, purge)
         previous = fold
 
 
+def _as_integers(fold: Fold) -> Fold:
+    """Return ``fold`` with every field a plain ``int``, or raise a `TypeError` naming it."""
+    values: dict[str, int] = {}
+    for field in fields(Fold):
+        value = getattr(fold, field.name)
+        try:
+            values[field.name] = operator.index(value)
+        except TypeError:
+            label = values.get("index", fold.index)
+            raise TypeError(
+                f"fold {label}: {field.name} must be an integer, got "
+                f"{type(value).__name__} {value!r}"
+            ) from None
+    return Fold(**values)
+
+
 def _check_one_fold(fold: Fold, purge: int) -> None:
     gap = fold.val_start - fold.fit_end
+    if fold.fit_end < 1:
+        raise FoldBoundaryError(
+            f"fold {fold.index}: the fit window [0, {fold.fit_end}) holds no rows; "
+            f"there is nothing to fit on",
+            detail={"fold": fold.index, "gap": gap, "purge": purge},
+        )
     if gap < purge:
         raise FoldBoundaryError(
             f"fold {fold.index}: validation starts at row {fold.val_start}, gap {gap} rows "
