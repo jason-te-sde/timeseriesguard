@@ -80,8 +80,10 @@ budget (p95 below 50 ms) are described in [docs/operations.md](docs/operations.m
 
 - `reports/metrics.json` is the source of every model number. It is written by
   `tsguard reproduce --profile full` (`make reproduce`), run locally on an Apple M2 with 16 GB of
-  memory, and it records the commit the code was at in `environment.git_sha` (with `+dirty` if the
-  working tree had changes), next to the platform, the library versions and the thread count.
+  memory, and it records the commit the code was at in `environment.git_sha` (with `+dirty` if a
+  tracked file had uncommitted changes) and the git tree hash of `src/` in `environment.source_tree`,
+  which names the code across merges, next to the platform, the library versions and the thread
+  count.
 - `reports/mlflow_runs.csv` is the export of every tracked run (8 tuning trials per model plus one
   final run per model and machine) and the source of the run count. `reports/latency.json`, written
   by `scripts/latency.py` against a running service, is the source of the latency figure.

@@ -186,27 +186,58 @@ def label_reads_at_selection(audits: Iterable[LabelAudit], selections: Iterable[
     return reads
 
 
+def _git(cwd: Path, *args: str) -> str:
+    """Run git in ``cwd`` and return its stripped stdout.
+
+    Raises:
+        OSError: git is not installed.
+        subprocess.CalledProcessError: git exited with a nonzero status.
+    """
+    done = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True)
+    return done.stdout.strip()
+
+
 def git_revision(cwd: Path) -> str:
-    """Return the commit the code is at, marked when the working tree has changes.
+    """Return the commit the code is at, marked when a tracked file has changes.
 
     Args:
         cwd: A directory inside the checkout.
 
     Returns:
-        The full sha of ``HEAD``, followed by ``+dirty`` when ``git status --porcelain`` lists
-        anything (untracked files included); ``"unknown"`` when ``cwd`` is not in a git
+        The full sha of ``HEAD``, followed by ``+dirty`` when ``git status --porcelain
+        --untracked-files=no`` lists anything: untracked files (a log, an output directory) do
+        not change the code, so they do not count. ``"unknown"`` when ``cwd`` is not in a git
         checkout with a commit, or git is not installed.
     """
     try:
-        sha = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=cwd, capture_output=True, text=True, check=True
-        ).stdout.strip()
-        status = subprocess.run(
-            ["git", "status", "--porcelain"], cwd=cwd, capture_output=True, text=True, check=True
-        ).stdout
+        sha = _git(cwd, "rev-parse", "HEAD")
+        status = _git(cwd, "status", "--porcelain", "--untracked-files=no")
     except (OSError, subprocess.CalledProcessError):
         return UNKNOWN_REVISION
-    return f"{sha}+dirty" if status.strip() else sha
+    return f"{sha}+dirty" if status else sha
+
+
+def git_source_tree(cwd: Path) -> str:
+    """Return the git tree hash of the package sources (``src/``), which names the code.
+
+    A commit sha changes with every merge, even one that leaves the code alone; the tree hash
+    of ``src/`` changes only when a source file does, so a published run stays identifiable
+    after any history rewrite or merge that keeps the sources.
+
+    Args:
+        cwd: A directory inside the checkout.
+
+    Returns:
+        The hash of ``HEAD:src``, followed by ``+dirty`` when a tracked file under ``src/`` has
+        uncommitted changes; ``"unknown"`` when ``cwd`` is not in a checkout with a ``src/``
+        directory at its root, or git is not installed.
+    """
+    try:
+        tree = _git(cwd, "rev-parse", "HEAD:src")
+        status = _git(cwd, "status", "--porcelain", "--untracked-files=no", "--", ":/src")
+    except (OSError, subprocess.CalledProcessError):
+        return UNKNOWN_REVISION
+    return f"{tree}+dirty" if status else tree
 
 
 def require_experiment_extra() -> None:
@@ -265,7 +296,8 @@ def reproduce(
     """
     require_experiment_extra()
     configure_runtime(threads=profile.run.threads)
-    revision = git_revision(Path(__file__).resolve().parent)
+    here = Path(__file__).resolve().parent
+    revision, source_tree = git_revision(here), git_source_tree(here)
     tuned, tuning_audits = _tune_all(profile, loader, tracker, progress)
     gc.collect()  # the tuning runners refer to themselves; free their caches before selecting
     records: list[_EntityRecord] = []
@@ -299,6 +331,7 @@ def reproduce(
             headline=headline,
             ablation=ablation,
             revision=revision,
+            source_tree=source_tree,
         )
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -333,6 +366,7 @@ def _metrics(
     headline: HeadlineModel,
     ablation: dict[str, AblationModel],
     revision: str,
+    source_tree: str,
 ) -> Metrics:
     """Assemble the validated metrics; the checkpoint and the final file differ in two fields."""
     return Metrics(
@@ -360,7 +394,7 @@ def _metrics(
                 for model, result in tuned.items()
             },
         ),
-        environment=_environment(revision),
+        environment=_environment(revision, source_tree),
     )
 
 
@@ -544,8 +578,12 @@ def _ablation_model(summary: AblationSummary) -> AblationModel:
     )
 
 
-def _environment(revision: str) -> dict[str, str]:
-    """Describe the machine and the code: versions, thread count, commit and time."""
+def _environment(revision: str, source_tree: str) -> dict[str, str]:
+    """Describe the machine and the code: versions, thread count, commit, sources and time.
+
+    ``source_tree`` is an addition to the first runs' environment: readers must treat it as
+    optional.
+    """
     versions = {}
     for package in _PACKAGES:
         try:
@@ -558,5 +596,6 @@ def _environment(revision: str) -> dict[str, str]:
         **versions,
         "torch_threads": str(torch.get_num_threads()),
         "git_sha": revision,
+        "source_tree": source_tree,
         "generated_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }

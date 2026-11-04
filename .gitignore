@@ -11,3 +11,5 @@ reports-ci/
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
+*.log
+run-out/

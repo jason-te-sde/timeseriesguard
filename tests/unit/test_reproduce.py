@@ -20,6 +20,7 @@ from tests.conftest import (
     load_synthetic,
     make_entity,
 )
+from tests.unit.test_report_and_claims import tiny_metrics
 from tsguard.data.labels import LabelAudit, Phase
 from tsguard.data.smd import ENTITIES, SMD_COMMIT, EntityData
 from tsguard.eval.protocols import PROTOCOLS
@@ -31,6 +32,7 @@ from tsguard.experiment.reproduce import (
     SMOKE,
     Profile,
     git_revision,
+    git_source_tree,
     label_reads_at_selection,
     reproduce,
     require_experiment_extra,
@@ -40,6 +42,7 @@ from tsguard.experiment.tracking import MemoryTracker
 from tsguard.experiment.tuning import FINAL_EXPERIMENT, TUNING_EXPERIMENT
 from tsguard.models import MODEL_NAMES
 from tsguard.models.space import DEFAULT_PARAMS
+from tsguard.repro.claims import publishable_problems
 from tsguard.repro.report import Metrics, best_model, read_metrics
 
 
@@ -145,6 +148,7 @@ def test_tiny_reproduce_describes_the_run(tiny_run):
     keys = set(m.environment)
     assert {"platform", "python", "numpy", "pandas", "scikit-learn", "torch"} <= keys
     assert {"optuna", "mlflow", "torch_threads", "git_sha", "generated_at"} <= keys
+    assert "source_tree" in keys
     assert m.environment["torch_threads"] == "1"
     assert m.environment["generated_at"].endswith("Z")
 
@@ -415,16 +419,98 @@ def git(cwd: Path, *args: str) -> str:
     return done.stdout.strip()
 
 
+def commit_all(cwd: Path, message: str) -> None:
+    git(cwd, "add", "-A")
+    git(cwd, "-c", "commit.gpgsign=false", "commit", "-q", "-m", message)
+
+
+@pytest.fixture
+def checkout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A git repository with a package under ``src/`` and a doc, committed once."""
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    repo = tmp_path / "repo"
+    (repo / "src" / "pkg").mkdir(parents=True)
+    (repo / "src" / "pkg" / "mod.py").write_text("X = 1\n")
+    (repo / "README.md").write_text("one\n")
+    git(repo, "init", "-q")
+    commit_all(repo, "first")
+    return repo
+
+
 def test_git_revision_outside_a_repository_is_unknown(tmp_path, monkeypatch):
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
     assert git_revision(tmp_path) == "unknown"
 
 
-def test_git_revision_marks_a_dirty_tree(tmp_path, monkeypatch):
+def test_git_revision_marks_a_modified_tracked_file(checkout):
+    sha = git(checkout, "rev-parse", "HEAD")
+    assert git_revision(checkout) == sha
+    (checkout / "README.md").write_text("two\n")
+    assert git_revision(checkout) == f"{sha}+dirty"
+
+
+def test_git_revision_ignores_untracked_files(checkout):
+    # A log file or an output directory beside the checkout is not a change to the code.
+    sha = git(checkout, "rev-parse", "HEAD")
+    (checkout / "run.log").write_text("x")
+    (checkout / "run-out").mkdir()
+    (checkout / "run-out" / "metrics.json").write_text("{}")
+    assert git_revision(checkout) == sha
+
+
+def test_git_revision_of_a_repository_without_a_commit_is_unknown(tmp_path, monkeypatch):
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
     git(tmp_path, "init", "-q")
-    git(tmp_path, "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "first")
-    sha = git(tmp_path, "rev-parse", "HEAD")
-    assert git_revision(tmp_path) == sha
-    (tmp_path / "new.txt").write_text("x")
-    assert git_revision(tmp_path) == f"{sha}+dirty"
+    assert git_revision(tmp_path) == "unknown"
+
+
+def test_git_source_tree_is_the_tree_hash_of_src(checkout):
+    assert git_source_tree(checkout) == git(checkout, "rev-parse", "HEAD:src")
+    assert git_source_tree(checkout / "src" / "pkg") == git(checkout, "rev-parse", "HEAD:src")
+
+
+def test_the_source_tree_survives_a_commit_that_leaves_src_alone(checkout):
+    before = git_source_tree(checkout)
+    sha = git(checkout, "rev-parse", "HEAD")
+    (checkout / "README.md").write_text("two\n")
+    commit_all(checkout, "docs only")
+    assert git(checkout, "rev-parse", "HEAD") != sha
+    assert git_source_tree(checkout) == before  # a merge of docs does not rename the code
+
+
+def test_the_source_tree_changes_with_a_source_file(checkout):
+    before = git_source_tree(checkout)
+    (checkout / "src" / "pkg" / "mod.py").write_text("X = 2\n")
+    commit_all(checkout, "change the code")
+    assert git_source_tree(checkout) != before
+
+
+def test_the_source_tree_is_marked_when_a_source_file_has_uncommitted_changes(checkout):
+    clean = git_source_tree(checkout)
+    (checkout / "README.md").write_text("two\n")
+    assert git_source_tree(checkout) == clean  # only the sources count
+    (checkout / "src" / "pkg" / "mod.py").write_text("X = 2\n")
+    assert git_source_tree(checkout) == f"{clean}+dirty"
+
+
+def test_the_source_tree_is_unknown_without_git_or_without_src(tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    assert git_source_tree(tmp_path) == "unknown"
+    git(tmp_path, "init", "-q")
+    (tmp_path / "README.md").write_text("x")
+    commit_all(tmp_path, "no src here")
+    assert git_source_tree(tmp_path) == "unknown"
+
+
+def test_the_environment_records_the_revision_and_the_source_tree():
+    environment = reproduce_module._environment("abc+dirty", "def")
+    assert environment["git_sha"] == "abc+dirty"
+    assert environment["source_tree"] == "def"
+
+
+def test_an_environment_without_a_source_tree_still_loads_and_is_publishable():
+    # The run that was already in progress when the key was added wrote none.
+    raw = tiny_metrics().model_dump(mode="json")
+    assert "source_tree" not in raw["environment"]
+    metrics = Metrics.model_validate(raw)
+    assert publishable_problems(metrics) == []
