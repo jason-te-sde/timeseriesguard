@@ -12,7 +12,14 @@ from types import MappingProxyType
 import numpy as np
 import pytest
 
-from tests.conftest import make_entity
+from tests.conftest import (
+    TINY,
+    TINY_N_TEST,
+    TINY_N_TRAIN,
+    TINY_SEGMENTS_PER_ENTITY,
+    load_synthetic,
+    make_entity,
+)
 from tsguard.data.labels import LabelAudit, Phase
 from tsguard.data.smd import ENTITIES, SMD_COMMIT, EntityData
 from tsguard.eval.protocols import PROTOCOLS
@@ -35,23 +42,6 @@ from tsguard.experiment.tuning import FINAL_EXPERIMENT, TUNING_EXPERIMENT
 from tsguard.models import MODEL_NAMES
 from tsguard.models.space import DEFAULT_PARAMS
 from tsguard.repro.report import Metrics, read_metrics
-
-N_TRAIN = 3000
-N_TEST = 2000
-SEGMENTS_PER_ENTITY = 2
-TINY = Profile(
-    "tiny",
-    ("synthetic-0", "synthetic-1"),
-    ("synthetic-0",),
-    1,
-    (0,),
-    RunConfig(ae_epochs=1, threads=1),
-)
-
-
-def load_synthetic(name: str, audit: LabelAudit) -> EntityData:
-    index = int(name.rsplit("-", 1)[1])
-    return make_entity(n_train=N_TRAIN, n_test=N_TEST, seed=index, name=name, audit=audit)
 
 
 @dataclass
@@ -139,8 +129,8 @@ def test_tiny_reproduce_describes_the_run(tiny_run):
     assert (m.profile, m.seed, m.schema_version) == ("tiny", 0, 1)
     assert m.dataset.source_commit == SMD_COMMIT
     assert (m.dataset.entities, m.dataset.channels) == (2, 38)
-    assert (m.dataset.train_steps, m.dataset.test_steps) == (2 * N_TRAIN, 2 * N_TEST)
-    assert m.dataset.anomaly_segments == 2 * SEGMENTS_PER_ENTITY
+    assert (m.dataset.train_steps, m.dataset.test_steps) == (2 * TINY_N_TRAIN, 2 * TINY_N_TEST)
+    assert m.dataset.anomaly_segments == 2 * TINY_SEGMENTS_PER_ENTITY
     assert m.protocol == {"chunk": 60, "cooldown": 60, "k_percent": 20}
     assert m.tuning.entities == ["synthetic-0"]
     assert m.tuning.n_trials == 1

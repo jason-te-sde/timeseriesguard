@@ -12,6 +12,8 @@ import pytest
 from tsguard.data.labels import AuditedLabels, LabelAudit
 from tsguard.data.smd import EntityData, default_data_dir, verify
 from tsguard.errors import TsguardError
+from tsguard.experiment.reproduce import Profile
+from tsguard.experiment.runner import RunConfig
 
 pytest_plugins = ["pytester"]
 
@@ -141,3 +143,26 @@ def make_entity(
         test=test,
         labels=AuditedLabels(labels, audit=LabelAudit() if audit is None else audit, entity=name),
     )
+
+
+TINY_N_TRAIN = 3000
+TINY_N_TEST = 2000
+TINY_SEGMENTS_PER_ENTITY = 2
+TINY = Profile(
+    "tiny",
+    ("synthetic-0", "synthetic-1"),
+    ("synthetic-0",),
+    1,
+    (0,),
+    RunConfig(ae_epochs=1, threads=1),
+)
+"""Two synthetic machines, one tuning trial, one ablation seed and one thread: seconds per run."""
+
+
+def load_synthetic(name: str, audit: LabelAudit) -> EntityData:
+    """Load ``synthetic-<i>`` for `TINY`: the entity `make_entity` builds from seed ``i``.
+
+    Matches the loader signature of ``reproduce``, so a test passes it as ``loader=``.
+    """
+    index = int(name.rsplit("-", 1)[1])
+    return make_entity(n_train=TINY_N_TRAIN, n_test=TINY_N_TEST, seed=index, name=name, audit=audit)
