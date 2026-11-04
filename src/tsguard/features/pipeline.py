@@ -5,9 +5,10 @@ mean and one scale per feature column, computed from the fit rows only. Evaluati
 rows afterwards would grade a detector on data its inputs were scaled with, so
 `FeaturePipeline.transform` refuses a start row before the fit end.
 
-A column that is constant over the fit rows standardizes to exactly zero, and no scale is
-below `MIN_SCALE`. NaN is legal only in the warmup at the series start, where it becomes 0.0;
-anywhere else it is an error, so a broken spec cannot hide behind a zero fill.
+A column that is constant over the fit rows standardizes to exactly zero, no scale is below
+`MIN_SCALE`, and no standardized value is beyond `STANDARD_CLIP`. NaN is legal only in the
+warmup at the series start, where it becomes 0.0; anywhere else it is an error, so a broken
+spec cannot hide behind a zero fill.
 
 Features are computed in blocks of output rows. Every spec's value at a row depends only on
 the trailing ``lookback`` rows, so each block is fed ``MAX_LOOKBACK - 1`` rows of history
@@ -34,6 +35,14 @@ SMD is min-max scaled to [0, 1] per channel, so a change below 0.1 % of a channe
 is noise. Without a floor, a near-constant channel (machine-1-1 channel 33 has a train scale of
 about 3e-6) turns the first real movement of the test rows into a value of 1e5 standard
 deviations, which swamps every detector.
+"""
+STANDARD_CLIP: Final = 50.0
+"""Bound on the absolute value of a standardized feature.
+
+A value beyond 50 sigma says nothing more about being anomalous than 50 sigma does. Scale-free
+features such as windowed kurtosis, on channels that are flat in training, otherwise reach
+1e4 to 1e5 sigma and swamp every distance-based detector. The bound was fixed before any model
+ran. Clipping acts on one value at a time, so it keeps every feature causal.
 """
 _STAT_COLUMNS: Final = 256  # columns reduced at once; bounds the temporaries of nanmean/nanstd
 
@@ -187,10 +196,11 @@ def _column_statistics(raw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _standardize(raw: np.ndarray, mean: np.ndarray, scale: np.ndarray) -> np.ndarray:
-    """Standardize ``raw`` in place, zero its NaN warmup, and return it as float32."""
+    """Standardize ``raw`` in place, zero its NaN warmup, clip it, and return it as float32."""
     raw -= mean
     raw /= scale
     np.copyto(raw, 0.0, where=np.isnan(raw))
+    np.clip(raw, -STANDARD_CLIP, STANDARD_CLIP, out=raw)
     return raw.astype(np.float32, order="C")
 
 
@@ -312,7 +322,8 @@ class FeaturePipeline:
             end_index: Number of rows to fit on.
 
         Returns:
-            The in-sample features, float32 ``(end_index, len(columns))``, C-contiguous.
+            The in-sample features, clipped to ``STANDARD_CLIP``: float32
+            ``(end_index, len(columns))``, C-contiguous.
 
         Raises:
             ValueError: As `fit`.

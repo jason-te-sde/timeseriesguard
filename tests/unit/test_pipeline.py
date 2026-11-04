@@ -11,6 +11,7 @@ from tsguard.errors import GUARD_FIT_END, LeakageError
 from tsguard.features.pipeline import (
     MIN_SCALE,
     RAW_SPECS,
+    STANDARD_CLIP,
     FeaturePipeline,
     compute_raw_features,
 )
@@ -367,8 +368,8 @@ def test_a_shifted_constant_channel_is_scaled_by_the_floor(full, entity):
     end = entity.train_end
     x = full.copy()
     x[:end, CONSTANT_CHANNEL] = 0.1
-    x[end:, CONSTANT_CHANNEL] = 0.2
-    expected = (0.2 - 0.1) / MIN_SCALE
+    x[end:, CONSTANT_CHANNEL] = 0.13
+    expected = (0.13 - 0.1) / MIN_SCALE  # 30 sigma, below the clip
 
     raw = FeaturePipeline(RAW_SPECS)
     raw.fit(x, end_index=end)
@@ -471,3 +472,75 @@ def test_nan_inside_the_declared_warmup_is_zero_after_standardizing(full):
     assert np.isfinite(out).all()
     assert (out[:2, 2] == 0.0).all()
     assert out[2, 2] != 0.0
+
+
+def _blip_series(full: np.ndarray, row: int) -> np.ndarray:
+    """The shared series with channel 37 flat at 0.5 except one value of 0.9 at ``row``."""
+    x = full.copy()
+    x[:, CONSTANT_CHANNEL] = 0.5
+    x[row, CONSTANT_CHANNEL] = 0.9
+    return x
+
+
+def test_a_blip_on_a_channel_that_was_flat_in_training_is_clipped(full, entity):
+    end = entity.train_end
+    blip = end + 300
+    x = _blip_series(full, blip)
+    p = FeaturePipeline().fit(x, end_index=end)
+    out = p.transform(x, start_index=end)
+    kurt = p.columns.index(f"roll_kurt_60[c{CONSTANT_CHANNEL}]")
+
+    raw = compute_raw_features(x, FEATURE_SPECS, rows=(end, len(x)))
+    assert p._scale is not None
+    assert p._scale[kurt] == MIN_SCALE  # flat in training: the kurtosis is 0 on every window
+    unclipped = raw[:, kurt] / MIN_SCALE
+    assert unclipped.max() > 100 * STANDARD_CLIP  # without the clip this is of order 1e4
+
+    window = slice(300, 360)  # the 60 windows that contain the blip
+    assert (out[window, kurt] == STANDARD_CLIP).all()
+    assert (out[:300, kurt] == 0.0).all()
+    assert (out[360:, kurt] == 0.0).all()
+    assert STANDARD_CLIP == 50.0
+    assert np.abs(out).max() <= STANDARD_CLIP
+    assert out.max() == STANDARD_CLIP
+
+
+def test_values_within_the_clip_are_unchanged_and_the_rest_are_clipped(full, entity):
+    end = entity.train_end
+    x = _blip_series(full, end + 300)
+    p = FeaturePipeline().fit(x, end_index=end)
+    out = p.transform(x, start_index=end)
+    assert p._mean is not None
+    assert p._scale is not None
+    raw = compute_raw_features(x, FEATURE_SPECS, rows=(end, len(x)))
+    unclipped = np.nan_to_num((raw - p._mean) / p._scale)
+    inside = np.abs(unclipped) <= STANDARD_CLIP
+    assert inside.sum() > 0.9 * inside.size
+    assert (~inside).any()  # the blip really drives some values past the clip
+    assert out[inside].tobytes() == unclipped[inside].astype(np.float32).tobytes()
+    np.testing.assert_array_equal(out[~inside], np.sign(unclipped[~inside]) * STANDARD_CLIP)
+    assert out.dtype == np.float32
+    assert out.flags.c_contiguous
+
+
+def test_a_negative_extreme_is_clipped_to_minus_the_bound(full, entity):
+    end = entity.train_end
+    x = full.copy()
+    x[:, CONSTANT_CHANNEL] = 0.5
+    x[end + 5, CONSTANT_CHANNEL] = 0.1
+    p = FeaturePipeline(RAW_SPECS).fit(x, end_index=end)
+    out = p.transform(x, start_index=end)
+    assert out[5, CONSTANT_CHANNEL] == -STANDARD_CLIP
+    assert np.abs(out).max() <= STANDARD_CLIP
+
+
+def test_the_clip_applies_in_sample_too(full, entity):
+    x = _blip_series(full, 1000)
+    p = FeaturePipeline(RAW_SPECS)
+    # one 0.4 spike in 4,000 flat rows is 63 sigma of its own fit rows
+    fit_transformed = p.fit_transform(x, end_index=len(x))
+    in_sample = p.transform_in_sample(x)
+    for out in (fit_transformed, in_sample):
+        assert out[1000, CONSTANT_CHANNEL] == STANDARD_CLIP
+        assert np.abs(out).max() <= STANDARD_CLIP
+    assert fit_transformed.tobytes() == in_sample.tobytes()
