@@ -66,8 +66,7 @@ convention = "google"
 
 [tool.mypy]
 strict = true
-# "scripts" joins this list when the directory lands; mypy refuses a path that does not exist.
-files = ["src", "tests"]
+files = ["src", "tests", "scripts"]
 
 [[tool.mypy.overrides]]
 module = ["sklearn.*", "joblib.*", "mlflow.*"]
