@@ -22,7 +22,8 @@ import torch
 
 from tests.conftest import TINY, load_synthetic
 from tsguard.data.labels import LabelAudit
-from tsguard.data.smd import EntityData, load_entity
+from tsguard.data.smd import EntityData, default_data_dir, load_entity, verify
+from tsguard.errors import TsguardError
 from tsguard.experiment.ablation import EntityLoader
 from tsguard.experiment.reproduce import SMOKE, Profile, reproduce
 from tsguard.experiment.tracking import MemoryTracker
@@ -32,6 +33,7 @@ from tsguard.repro.report import Metrics, deterministic_view, read_metrics
 
 DIGEST_NAMES = {"pipeline", "detector", "test_scores"}
 STOCHASTIC_MODELS = {"iforest", "cnn_ae", "lstm_ae"}  # zscore draws nothing from the seed
+REAL_ENTITY = "machine-1-1"
 METRICS_FILE = "metrics.json"
 
 
@@ -43,6 +45,28 @@ def restore_runtime() -> Iterator[None]:
     yield
     torch.set_num_threads(threads)
     torch.use_deterministic_algorithms(deterministic)
+
+
+@pytest.fixture(scope="module")
+def machine_dir() -> Path:
+    """Return the SMD cache, checked for the one machine the real-data test loads.
+
+    ``smd_dir`` verifies all 28 machines; the CI job fetches only this one, so the check here
+    is limited to it. Missing data fails the test and never skips it.
+    """
+    root = default_data_dir()
+    problem: TsguardError | None = None
+    try:
+        verify([REAL_ENTITY], dest=root)
+    except TsguardError as error:
+        problem = error
+    if problem is not None:
+        pytest.fail(
+            f"SMD data missing: run `uv run tsguard data fetch --entities {REAL_ENTITY}` "
+            f"({problem})",
+            pytrace=False,
+        )
+    return root
 
 
 def run(profile: Profile, loader: EntityLoader, out_dir: Path) -> Metrics:
@@ -140,17 +164,17 @@ def test_a_different_seed_changes_the_bytes(tiny_seed_0, tmp_path):
 
 
 @pytest.mark.data
-def test_smoke_profile_twice_on_real_data(tmp_path, smd_dir):
+def test_smoke_profile_twice_on_real_data(tmp_path, machine_dir):
     profile = dataclasses.replace(
         SMOKE,
         name="smoke-determinism",
-        entities=("machine-1-1",),
+        entities=(REAL_ENTITY,),
         n_trials=1,
         ablation_seeds=(0,),
     )
 
     def loader(name: str, audit: LabelAudit) -> EntityData:
-        return load_entity(name, audit=audit, dest=smd_dir)
+        return load_entity(name, audit=audit, dest=machine_dir)
 
     a = run(profile, loader, tmp_path / "a")
     b = run(profile, loader, tmp_path / "b")
