@@ -5,7 +5,7 @@ import json
 import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import httpx
@@ -137,6 +137,25 @@ def run_script(
         clock=stub.clock,
     )
     return code
+
+
+def test_the_default_clock_is_perf_counter(latency, entity, monkeypatch, tmp_path):
+    stub = StubService(entity, lambda i: 0.020)
+    # Only perf_counter exists on the stand-in: any other clock the script reached for
+    # (time.time, time.monotonic) would raise AttributeError.
+    monkeypatch.setattr(latency, "time", SimpleNamespace(perf_counter=stub.clock))
+    out = tmp_path / "latency.json"
+    code: int = latency.run(
+        url=URL,
+        n=20,
+        warmup=5,
+        budget_ms=50.0,
+        out=out,
+        loader=lambda name: stub.entity,
+        transport=stub.transport,
+    )
+    assert code == 0
+    assert json.loads(out.read_text())["p95_ms"] == 20.0
 
 
 def test_percentile_ms(latency):
