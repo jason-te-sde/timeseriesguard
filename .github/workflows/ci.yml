@@ -155,3 +155,56 @@ jobs:
           name: smoke-artifacts
           path: artifacts/
           if-no-files-found: warn
+
+  claims:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      UV_PYTHON: "3.11"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.12.19"
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --all-extras --group dev --python 3.11 --locked
+      - name: Check the README numbers against reports/
+        run: |
+          # Until the first metrics are committed there is nothing to compare. The moment any
+          # report file exists every check is enforced, so a claims.json or an mlflow_runs.csv
+          # without its metrics.json fails here instead of passing by omission.
+          shopt -s nullglob
+          reports=(reports/*.json reports/*.csv)
+          if [ "${#reports[@]}" -eq 0 ]; then
+            echo "no reports/metrics.json yet"
+          else
+            uv run tsguard claims --check
+          fi
+
+  clean-clone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      UV_PYTHON: "3.11"
+    steps:
+      # A cold start on purpose: no actions/cache and no uv cache, so a dependency or a data file
+      # that only this machine happens to have already cannot hide here.
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.12.19"
+          enable-cache: false
+      - name: Install dependencies
+        run: uv sync --all-extras --group dev --python 3.11 --locked
+      - name: Fetch the smoke entities
+        run: uv run tsguard data fetch --entities machine-1-1 machine-2-1
+      - name: Reproduce the smoke profile
+        run: uv run tsguard reproduce --profile smoke --out artifacts/clean --tracking-uri sqlite:///artifacts/clean.db
+      - name: Keep the clean-clone artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: clean-clone-artifacts
+          path: artifacts/
+          if-no-files-found: warn

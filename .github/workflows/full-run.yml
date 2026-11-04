@@ -1,0 +1,48 @@
+name: Full run
+
+# The committed reports/metrics.json comes from the local M2 run. This workflow exists to
+# re-derive it on a clean Linux runner: start it by hand (Actions, Full run, Run workflow) and
+# compare the uploaded metrics.json with the committed one. It has no schedule on purpose: the
+# run takes hours, so it happens only when someone asks for it.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: full-run
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  full-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      UV_PYTHON: "3.11"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.12.19"
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --all-extras --group dev --python 3.11 --locked
+      - name: Restore the SMD cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/tsguard
+          key: smd-${{ hashFiles('src/tsguard/data/smd_manifest.json') }}
+      - name: Fetch SMD (a no-op on a warm cache)
+        run: uv run tsguard data fetch
+      - name: Reproduce the full profile
+        run: uv run tsguard reproduce --profile full --out artifacts/full
+      # The directory holds metrics.json and mlflow_runs.csv, and the MLflow store beside them:
+      # after a failure the store is the only trace of the runs that did finish.
+      - name: Keep the full-run artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: full-run-artifacts
+          path: artifacts/full
+          if-no-files-found: warn
