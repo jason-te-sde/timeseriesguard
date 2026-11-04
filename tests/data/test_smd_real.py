@@ -8,6 +8,7 @@ import pytest
 from tsguard.data.contract import N_CHANNELS
 from tsguard.data.labels import LabelAudit, Phase
 from tsguard.data.smd import ENTITIES, EntityData, load_entity
+from tsguard.eval.protocols import segments
 
 pytestmark = pytest.mark.data
 
@@ -17,12 +18,6 @@ def entities(smd_dir: Path) -> list[EntityData]:
     """All 28 machines, loaded once for the module; ``load_entity`` runs the contract."""
     audit = LabelAudit()
     return [load_entity(name, audit=audit, dest=smd_dir) for name in ENTITIES]
-
-
-def count_segments(labels: np.ndarray) -> int:
-    """Count maximal runs of ones, i.e. 0 to 1 transitions (Task 10's segments() replaces it)."""
-    padded = np.concatenate([[0], labels.astype(np.int8)])
-    return int(np.sum((padded[1:] == 1) & (padded[:-1] == 0)))
 
 
 def test_every_entity_loads_and_passes_contract(entities):
@@ -41,7 +36,7 @@ def test_anomaly_segment_count_is_327(entities):
     total = 0
     for entity in entities:
         with entity.labels.audit.phase(Phase.FINAL_EVALUATION):
-            total += count_segments(entity.labels.read("test_smd_real"))
+            total += len(segments(entity.labels.read("test_smd_real")))
     assert total == 327
 
 
