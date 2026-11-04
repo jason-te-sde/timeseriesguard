@@ -135,8 +135,10 @@ restart `tsguard serve`): a process loads its bundle once, at start.
 
 ## Latency budget
 
-The budget is a p95 below **50 ms** per score request (`P95_BUDGET_MS` in `tsguard.repro.claims`),
-measured against a running service with sequential requests over one keep-alive connection, after a
+The budget is a p95 below **50 ms** per score request (`P95_BUDGET_MS` in `tsguard.repro.claims`).
+What is measured is the client-side HTTP round trip: the time from a ready request body to the
+fully read response, so it includes the service's JSON parsing, scoring and response and the hop to
+it, not the scoring time alone. Requests are sequential over one keep-alive connection, after a
 warm-up. `scripts/latency.py` measures it (`make latency` writes `artifacts/latency.json`):
 
 ```sh
@@ -146,11 +148,15 @@ uv run python scripts/latency.py --n 2000 --warmup 100 --budget-ms 50 --out repo
 It asks `/v1/model` for the machine and the rows a request needs, loads that machine's whole series
 (train and test rows, no labels), and sends request `i` for the `required_rows` rows ending at test
 row `i`, wrapping around the test range, so the first requests reach back into the train rows. It
-reports p50, p95, p99 and the maximum, and exits 1 if the p95 is not below the budget, if any
-response is not a 200, or if the service cannot be reached. CI's `container` job runs it with the
+reports p50, p95, p99 and the maximum, and records the `model` and `bundle_sha256` the service
+reported, so the file says which service it measured. It exits 1 if the p95 is not below the
+budget, if any response is not a 200, or if the service cannot be reached. CI's `container` job runs it with the
 same arguments against the container and writes `artifacts/latency-ci.json`, which it uploads.
 `tsguard claims --write` puts the `p95_ms` of `reports/latency.json` next to the budget in
-`claims.json`. No measurement has been committed yet.
+`claims.json` and the README row "p95 HTTP round trip, client-side (ms)". It refuses a
+`latency.json` whose `model` is not the headline model, or that names none: serve the headline
+model (`make bundle BUNDLE_ARGS="--metrics reports/metrics.json"`) and measure again. No
+measurement has been committed yet.
 
 If the p95 is over budget:
 

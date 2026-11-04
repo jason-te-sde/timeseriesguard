@@ -34,7 +34,7 @@ END: Final = "<!-- claims:end -->"
 """The README line that closes the generated block."""
 
 P95_BUDGET_MS: Final = 50.0
-"""The per-request p95 latency the serving claim is measured against, in milliseconds."""
+"""The p95 HTTP round trip per score request the serving claim is measured against, in ms."""
 
 MIN_MLFLOW_RUNS: Final = 30
 """The fewest tracked runs a reported experiment may rest on."""
@@ -43,6 +43,7 @@ _MODEL_ORDER: Final = ("zscore", "iforest", "cnn_ae", "lstm_ae")
 _REPORTS: Final = "reports"
 _RUN_ID_COLUMN: Final = "run_id"
 _STALE_README: Final = "README block differs from metrics.json; run `tsguard claims --write`"
+_RERUN_LATENCY: Final = "serve the headline model and rerun scripts/latency.py"
 _SOURCE_OF: Final = MappingProxyType(
     {
         "mlflow_runs": "mlflow_runs.csv",
@@ -71,7 +72,8 @@ class Claims:
             ``f1_points`` and ``f1_relative_pct`` (means) with their ``_std`` counterparts, each
             rounded to 1 decimal.
         mlflow_runs: Tracked runs in ``mlflow_runs.csv``.
-        p95_ms: The measured p95 latency, or None when ``latency.json`` is absent.
+        p95_ms: The measured p95 HTTP round trip of the headline model's service, client-side, or
+            None when ``latency.json`` is absent.
         p95_budget_ms: The latency budget the measurement is compared with.
     """
 
@@ -161,7 +163,8 @@ def _count_runs(path: Path) -> int:
         raise ValueError(f"{path.name}: not a readable CSV: {exc}") from exc
 
 
-def _read_p95(path: Path) -> float:
+def _read_p95(path: Path, *, headline_model: str) -> float:
+    """Return ``p95_ms``, if the file says it was measured on the headline model."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
@@ -169,6 +172,17 @@ def _read_p95(path: Path) -> float:
     value = data.get("p95_ms") if isinstance(data, dict) else None
     if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
         raise ValueError(f"{path.name}: expected a finite number under p95_ms, got {value!r}")
+    model = data.get("model")
+    if model is None:
+        raise ValueError(
+            f"{path.name}: records no model, so its p95 cannot be tied to the headline model "
+            f"{headline_model!r}; {_RERUN_LATENCY}"
+        )
+    if model != headline_model:
+        raise ValueError(
+            f"{path.name}: measured on model {model!r}, but the headline model is "
+            f"{headline_model!r}; {_RERUN_LATENCY}"
+        )
     return float(value)
 
 
@@ -178,21 +192,23 @@ def derive_claims(metrics: Metrics, *, mlflow_csv: Path, latency_json: Path | No
     Args:
         metrics: The validated ``metrics.json``.
         mlflow_csv: The exported MLflow runs; every row after the header is one run.
-        latency_json: ``{"p95_ms": ...}`` from the latency benchmark. None, or a path that does
-            not exist, means the benchmark was not run and gives ``p95_ms = None``.
+        latency_json: ``{"p95_ms": ..., "model": ...}`` from the latency benchmark; the model
+            must be the headline model. None, or a path that does not exist, means the
+            benchmark was not run and gives ``p95_ms = None``.
 
     Returns:
         The claims.
 
     Raises:
         ValueError: The CSV has no header row with a ``run_id`` column, or the latency file is
-            not a JSON object with a finite ``p95_ms``; the message names the file.
+            not a JSON object with a finite ``p95_ms``, or it was measured on a model other
+            than the headline model (or names none); the message names the file.
         FileNotFoundError: ``mlflow_csv`` does not exist.
     """
     low, high = metrics.headline.ci95
     p95_ms = None
     if latency_json is not None and latency_json.exists():
-        p95_ms = _read_p95(latency_json)
+        p95_ms = _read_p95(latency_json, headline_model=metrics.headline.model)
     return Claims(
         train_steps=metrics.dataset.train_steps,
         test_steps=metrics.dataset.test_steps,
@@ -226,9 +242,9 @@ def _signed(value: float, digits: int) -> str:
 def _claims_rows(claims: Claims) -> list[str]:
     low, high = claims.headline_ci95
     if claims.p95_ms is None:
-        latency = f"not measured (budget {claims.p95_budget_ms:g} ms)"
+        latency = f"not measured (budget {claims.p95_budget_ms:g})"
     else:
-        latency = f"{claims.p95_ms:.1f} ms (budget {claims.p95_budget_ms:g} ms)"
+        latency = f"{claims.p95_ms:.1f} (budget {claims.p95_budget_ms:g})"
     return [
         _row(["Claim", "Value"]),
         _row(["---", "---"]),
@@ -245,7 +261,7 @@ def _claims_rows(claims: Claims) -> list[str]:
             ]
         ),
         _row(["MLflow runs", str(claims.mlflow_runs)]),
-        _row(["p95 inference latency", latency]),
+        _row(["p95 HTTP round trip, client-side (ms)", latency]),
     ]
 
 

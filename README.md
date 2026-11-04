@@ -86,7 +86,9 @@ budget (p95 below 50 ms) are described in [docs/operations.md](docs/operations.m
   count.
 - `reports/mlflow_runs.csv` is the export of every tracked run (8 tuning trials per model plus one
   final run per model and machine) and the source of the run count. `reports/latency.json`, written
-  by `scripts/latency.py` against a running service, is the source of the latency figure.
+  by `scripts/latency.py` against a running service, is the source of the latency figure: a
+  client-side HTTP round trip, taken on the headline model (the file records the model and bundle
+  it measured, and `tsguard claims` refuses any other).
 - `reports/claims.json` and the block above are derived from these three files by
   `tsguard claims --write`; `tsguard claims --check` recomputes them.
 - The headline model is chosen by its validation objective on injected anomalies, before any test

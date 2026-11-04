@@ -1,4 +1,4 @@
-"""Measure the request latency of a running tsguard service and check it against a budget.
+"""Measure the HTTP round trip of a running tsguard service and check it against a budget.
 
 Start the service (``make container-up``, or ``tsguard serve --bundle ...``), then::
 
@@ -114,7 +114,7 @@ def run(
             timeout=REQUEST_TIMEOUT_S,
             trust_env=False,  # a proxy in the path would be measured as part of the service
         ) as client:
-            samples = _measure(client, n=n, warmup=warmup, loader=loader, clock=now)
+            info, samples = _measure(client, n=n, warmup=warmup, loader=loader, clock=now)
     except httpx.HTTPError as error:
         print(f"latency: {url}: {error}", file=sys.stderr)
         return 1
@@ -123,6 +123,8 @@ def run(
         return 1
 
     result: dict[str, Any] = {
+        "model": info.model,
+        "bundle_sha256": info.bundle_sha256,
         "n": n,
         "warmup": warmup,
         "p50_ms": _rounded(percentile_ms(samples, 50)),
@@ -162,8 +164,12 @@ def _measure(
     warmup: int,
     loader: Loader,
     clock: Callable[[], float],
-) -> list[float]:
-    """Send ``warmup + n`` score requests and return the durations of the last ``n``, in seconds."""
+) -> tuple[ModelInfo, list[float]]:
+    """Send ``warmup + n`` score requests to the service.
+
+    Returns:
+        What ``GET /v1/model`` reported, and the durations of the last ``n`` requests in seconds.
+    """
     response = client.get(MODEL_PATH)
     response.raise_for_status()
     info = ModelInfo.model_validate_json(response.content)
@@ -196,7 +202,7 @@ def _measure(
             )
         if i >= warmup:
             samples.append(elapsed)
-    return samples
+    return info, samples
 
 
 def _score_body(entity: str, full: np.ndarray, last: int, rows: int) -> bytes:

@@ -23,6 +23,8 @@ N_TEST = 120
 REQUIRED_ROWS = 64
 FIT_END = 150
 RESULT_KEYS = {
+    "model",
+    "bundle_sha256",
     "n",
     "warmup",
     "p50_ms",
@@ -69,9 +71,13 @@ class StubService:
         required_rows: int = REQUIRED_ROWS,
         fit_end: int = FIT_END,
         fail_at: int | None = None,
+        model: str = "iforest",
+        bundle_sha256: str = "0" * 64,
     ) -> None:
         self.entity = entity
         self.step = step
+        self.model = model
+        self.bundle_sha256 = bundle_sha256
         self.required_rows = required_rows
         self.fit_end = fit_end
         self.fail_at = fail_at
@@ -86,13 +92,13 @@ class StubService:
         if request.method == "GET" and request.url.path == "/v1/model":
             info = ModelInfo(
                 entity=self.entity.name,
-                model="iforest",
+                model=self.model,
                 params={},
                 threshold=0.9,
                 required_rows=self.required_rows,
                 fit_end=self.fit_end,
                 feature_columns=100,
-                bundle_sha256="0" * 64,
+                bundle_sha256=self.bundle_sha256,
                 source_commit="stub",
             )
             return httpx.Response(200, content=info.model_dump_json())
@@ -107,12 +113,12 @@ class StubService:
             return httpx.Response(500, json={"detail": "boom"})
         answer = ScoreResponse(
             entity=parsed.entity,
-            model="iforest",
+            model=self.model,
             row_index=parsed.first_index + len(parsed.history) - 1,
             score=0.5,
             threshold=0.9,
             is_anomaly=False,
-            bundle_sha256="0" * 64,
+            bundle_sha256=self.bundle_sha256,
         )
         return httpx.Response(200, content=answer.model_dump_json())
 
@@ -193,6 +199,15 @@ def test_within_budget_returns_0_and_writes_the_result(latency, entity, capsys, 
     assert result["url"] == URL
     assert set(result["environment"]) == {"platform", "python", "cpu_count"}
     assert json.loads(capsys.readouterr().out) == result
+
+
+def test_the_result_records_the_model_and_the_bundle_that_were_measured(latency, entity, tmp_path):
+    # Taken from GET /v1/model, so a latency file says which service it describes.
+    stub = StubService(entity, lambda i: 0.005, model="cnn_ae", bundle_sha256="ab" * 32)
+    out = tmp_path / "latency.json"
+    assert run_script(latency, stub, out=out) == 0
+    result = json.loads(out.read_text())
+    assert (result["model"], result["bundle_sha256"]) == ("cnn_ae", "ab" * 32)
 
 
 def test_the_budget_is_exclusive(latency, entity):

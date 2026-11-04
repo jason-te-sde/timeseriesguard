@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -155,6 +156,11 @@ def tiny_metrics() -> Metrics:
     )
 
 
+def write_latency(path: Path, p95_ms: float = 12.3, *, model: str = HEADLINE) -> None:
+    """Write a ``latency.json`` the way scripts/latency.py does, for the fields claims reads."""
+    path.write_text(json.dumps({"p95_ms": p95_ms, "model": model, "bundle_sha256": "0" * 64}))
+
+
 def write_runs_csv(path: Path, rows: int) -> None:
     with path.open("w", newline="") as f:
         writer = csv.writer(f)
@@ -171,7 +177,7 @@ def repo(tmp_path: Path) -> Path:
     reports.mkdir()
     write_metrics(reports / "metrics.json", tiny_metrics())
     write_runs_csv(reports / "mlflow_runs.csv", 32)
-    (reports / "latency.json").write_text(json.dumps({"p95_ms": 12.3}))
+    write_latency(reports / "latency.json")
     (tmp_path / "README.md").write_text(README_TEXT)
     return tmp_path
 
@@ -306,6 +312,33 @@ def test_derive_claims_rejects_a_latency_file_without_p95(repo):
         _derive(repo)
 
 
+def test_derive_claims_refuses_a_latency_measured_on_another_model(repo):
+    write_latency(repo / "reports" / "latency.json", model="iforest")
+    message = (
+        "latency.json: measured on model 'iforest', but the headline model is 'cnn_ae'; "
+        "serve the headline model and rerun scripts/latency.py"
+    )
+    with pytest.raises(ValueError, match=re.escape(message)):
+        _derive(repo)
+
+
+def test_derive_claims_refuses_a_latency_file_that_names_no_model(repo):
+    (repo / "reports" / "latency.json").write_text(json.dumps({"p95_ms": 12.3}))
+    with pytest.raises(ValueError, match=r"latency\.json: records no model.*'cnn_ae'"):
+        _derive(repo)
+
+
+def test_a_latency_measured_on_another_model_is_a_message_for_check_and_an_error_for_write(repo):
+    write_claims(repo)
+    write_latency(repo / "reports" / "latency.json", model="zscore")
+    assert check_claims(repo) == [
+        "reports/latency.json: measured on model 'zscore', but the headline model is 'cnn_ae'; "
+        "serve the headline model and rerun scripts/latency.py"
+    ]
+    with pytest.raises(ValueError, match="measured on model 'zscore'"):
+        write_claims(repo)
+
+
 def test_block_is_deterministic_and_ordered_by_report_order(repo):
     metrics = tiny_metrics()
     claims = _derive(repo)
@@ -335,7 +368,7 @@ def test_block_claims_table_and_headline_row(repo):
     assert "| Test steps | 708,420 |" in block
     assert "| Headline event-level AUC-PR | 0.82 (95% CI 0.71 to 0.91) |" in block
     assert "| MLflow runs | 32 |" in block
-    assert "| p95 inference latency | 12.3 ms (budget 50 ms) |" in block
+    assert "| p95 HTTP round trip, client-side (ms) | 12.3 (budget 50) |" in block
     header = (
         "| Model | Validation objective | point_wise | point_adjust | pa_percent_k | event_level |"
     )
@@ -347,7 +380,8 @@ def test_block_claims_table_and_headline_row(repo):
 
 def test_block_says_so_when_latency_was_not_measured(repo):
     block = render_readme_block(_derive(repo, latency=False), tiny_metrics())
-    assert "| p95 inference latency | not measured (budget 50 ms) |" in block
+    assert "| p95 HTTP round trip, client-side (ms) | not measured (budget 50) |" in block
+    assert "inference latency" not in block
 
 
 def test_block_ablation_table(repo):
@@ -730,7 +764,7 @@ def _stale_metrics(root):
 
 
 def _stale_latency(root):
-    (root / "reports" / "latency.json").write_text(json.dumps({"p95_ms": 45.67}))
+    write_latency(root / "reports" / "latency.json", 45.67)
 
 
 def _removed_latency(root):
