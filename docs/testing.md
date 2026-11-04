@@ -15,7 +15,7 @@ so `uv run pytest` is the fast suite and needs neither the dataset nor more than
 | Unit | `tests/unit` | `make test` (`uv run pytest` with coverage, floor 80 %) | `test` (Python 3.11 and 3.12) |
 | Leakage | `tests/leakage` | `make leakage` | `leakage`, and `test` (the default run includes it) |
 | Protocol | `tests/protocol` | `make protocol` (needs the dataset) | `protocol` |
-| Determinism | `tests/determinism`: the whole `reproduce` run twice with one seed must give identical digests (two `slow` tests on synthetic machines, one `data` test on machine-1-1); plus a same-seed test per component in `tests/unit` | `uv run pytest tests/determinism -m "slow or data"`; the unit ones with `uv run pytest -k "deterministic or same_seed"` | `determinism` runs `tests/determinism`, `test` the unit ones |
+| Determinism | `tests/determinism`: the whole `reproduce`, run twice with one seed in one process, must give identical digests, on synthetic machines (`slow`) and on machine-1-1 (`data`); a second `slow` test is the control, in which a different seed must change the digests. Plus a same-seed test per component in `tests/unit` | `uv run pytest tests/determinism -m "slow or data"`; the unit ones with `uv run pytest -k "deterministic or same_seed"` | `determinism` runs `tests/determinism`, `test` the unit ones |
 | Data | anything marked `data` | `uv run tsguard data fetch`, then `uv run pytest -m data` | `protocol` runs `tests/protocol` and `tests/data` |
 | Slow | anything marked `slow`: the tiny end-to-end `reproduce` in `tests/unit/test_reproduce.py` and `tests/determinism` | `uv run pytest -m slow` | `smoke` (all but `tests/determinism`, which has its own job) |
 
@@ -24,12 +24,14 @@ Around the tests:
 - `make lint type` runs `ruff check`, `ruff format --check` and `mypy` (strict for `src` and
   `scripts`; test functions may be unannotated). CI job `lint`.
 - `make smoke` runs `tsguard reproduce --profile smoke` on two real machines, every phase included.
-  CI jobs `smoke` (warm caches, every push and pull request) and `clean-clone` (pushes to `main`
-  only, with no cache of any kind, so a dependency or a data file that only one machine happens to
-  have cannot hide).
+  CI jobs `smoke` (warm caches, on pushes to `main` and on pull requests) and `clean-clone` (pushes
+  to `main` only, with no cache of any kind, so a dependency or a data file that only one machine
+  happens to have cannot hide).
 - `make bundle container-up latency` builds a bundle for machine-1-1, starts the service in its
   container and asserts a p95 below 50 ms over 2,000 requests. CI job `container`.
-- `uv run tsguard claims --check` compares the README numbers with `reports/`. CI job `claims`.
+- `uv run tsguard claims --check` compares the README block and `reports/claims.json` with the
+  files in `reports/`. CI job `claims`, which enforces this only once `reports/` holds a `.json` or
+  `.csv` file; until then it prints `no reports/metrics.json yet` and passes.
 - The `hygiene` job rejects a commit message that carries a `Co-Authored-By:` trailer.
 
 Gaps, stated so nobody assumes otherwise:
@@ -38,8 +40,9 @@ Gaps, stated so nobody assumes otherwise:
   carries the `data` marker but lives in `tests/unit`, and the jobs that fetch data select
   `tests/protocol`, `tests/data` and `tests/determinism` only. It runs locally with
   `uv run pytest -m data`.
-- **Determinism is checked on one platform.** Two runs on the same machine must agree bit for bit;
-  nothing compares a macOS run with a Linux run, and nothing claims they agree.
+- **Determinism is checked in one process on one platform.** Two runs in the same process on the
+  same machine must agree bit for bit; nothing compares two processes' runs, or a macOS run with a
+  Linux run, and nothing claims they agree.
 
 None of the CI jobs has run yet: the GitHub repository does not exist, so the workflows are written
 and linted (`actionlint`) but have never executed. Until they have, every row of the table above is
@@ -47,9 +50,11 @@ verified locally only.
 
 ### Tests that need the dataset fail, they never skip
 
-A test marked `data` uses the `smd_dir` fixture, which verifies the cache against the packaged
-manifest and fails with `SMD data missing: run uv run tsguard data fetch` when it cannot. A skipped
-data test in CI would read as a pass.
+A test marked `data` verifies the cache against the packaged manifest before it reads anything, and
+fails when it cannot. Most use the `smd_dir` fixture, which checks all 28 machines and fails with
+`SMD data missing: run uv run tsguard data fetch`; the determinism test uses its own `machine_dir`
+fixture, which checks only machine-1-1, because its CI job fetches only that machine. A skipped data
+test in CI would read as a pass.
 
 ### Randomness in tests
 

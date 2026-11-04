@@ -59,8 +59,9 @@ curl -s http://127.0.0.1:8000/v1/model      # entity, model, threshold, required
   `required_rows` are read; the rest only costs parsing time.
 
 The response carries `score`, `threshold`, `is_anomaly` (`score >= threshold`), `row_index` and the
-`bundle_sha256` of the file that produced it. The score equals the score the batch evaluation gave the
-same row.
+`bundle_sha256` of the file that produced it. The score matches the score the batch evaluation gave
+the same row within a relative 1e-6 (tested for a feature model and an autoencoder); a reloaded
+bundle's batch scores over the test rows are bit-identical to the experiment's.
 
 ## What each error means and what to send instead
 
@@ -73,8 +74,9 @@ Every refusal says what to send instead. None of them echoes the request back.
 | 422 | `{"message", "fit_end"}` | The scored row lies inside the rows the feature scaling was fitted on. Scoring it would grade the model on its own fitting data (guard `fit_end`). | Score rows from `fit_end` on. Earlier rows may still appear in `history` as context. |
 | 422 | `[{"type", "loc", "msg"}, ...]` | Not a valid request. `loc` points at the field. | Fix that field: every row has 38 numbers; values are finite with magnitude at most `1e6` (the data itself is in [0, 1]); `history` has 1 to 10,000 rows; `first_index` is an integer from 0 to `2**53 - 10000`; numbers are JSON numbers, not strings or booleans; no field beyond `entity`, `first_index` and `history`. |
 
-A 404 whose `detail` is the string `"Not Found"` is a wrong path, not a wrong machine; the routes are
-`GET /healthz`, `GET /v1/model` and `POST /v1/score`.
+A 404 whose `detail` is the string `"Not Found"` is a wrong path, not a wrong machine, and a 405
+(`"Method Not Allowed"`) is the right path with the wrong method, such as a `GET /v1/score`. The
+routes are `GET /healthz`, `GET /v1/model` and `POST /v1/score`.
 
 **Any 500 is a bug.** Every input found so far to reach a 500 (huge magnitudes, a huge `first_index`,
 windows of tiny magnitudes) is now refused by the schema or handled by the features, so a 500 means a
@@ -141,12 +143,14 @@ warm-up. `scripts/latency.py` measures it (`make latency` writes `artifacts/late
 uv run python scripts/latency.py --n 2000 --warmup 100 --budget-ms 50 --out reports/latency.json
 ```
 
-It asks `/v1/model` for the machine and the rows a request needs, loads that machine's test rows
-(no labels), and sends request `i` for the rows ending at test row `i`, wrapping around the test
-range. It reports p50, p95, p99 and the maximum, and exits 1 if the p95 is not below the budget, if
-any response is not a 200, or if the service cannot be reached. CI's `container` job runs it with
-these arguments against the container. `tsguard claims --write` puts the `p95_ms` of
-`reports/latency.json` next to the budget in `claims.json`. No measurement has been committed yet.
+It asks `/v1/model` for the machine and the rows a request needs, loads that machine's whole series
+(train and test rows, no labels), and sends request `i` for the `required_rows` rows ending at test
+row `i`, wrapping around the test range, so the first requests reach back into the train rows. It
+reports p50, p95, p99 and the maximum, and exits 1 if the p95 is not below the budget, if any
+response is not a 200, or if the service cannot be reached. CI's `container` job runs it with the
+same arguments against the container and writes `artifacts/latency-ci.json`, which it uploads.
+`tsguard claims --write` puts the `p95_ms` of `reports/latency.json` next to the budget in
+`claims.json`. No measurement has been committed yet.
 
 If the p95 is over budget:
 

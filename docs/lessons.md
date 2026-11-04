@@ -21,8 +21,10 @@ nearly did, what it looked like, and the rule it left behind in the code.
   the z-score detector produced scores and frozen thresholds in the thousands. Its scale is now at
   least one training standard deviation.
 - **Feature bagging is not free at 2,246 columns.** Isolation Forest with `max_features < 1.0` copies
-  a column subset for every tree and was measured roughly 40 times slower; it already picks a random
-  feature at every split. `max_features` is fixed at 1.0 and is not tuned.
+  a column subset for every tree. Measured with 200 trees, fitting 24,000 rows and scoring 28,000,
+  against `max_features=1.0`: `0.5` was 73 times slower to fit and 39 times slower to score, `0.1` 15
+  and 8 times. The forest already picks a random feature at every split, so `max_features` is fixed
+  at 1.0 and is not tuned.
 - **A guard test can pass for the wrong reason.** The first versions of the backward-fill and
   interpolation defects opened their gaps with a whole-block median. `assert_causal` caught them, but
   for reading the median, not for the fill direction, and a forward fill behind the same mask was

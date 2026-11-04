@@ -32,11 +32,11 @@ schema may change between minor versions.
   `metrics.json`, with a checkpoint before the ablation; `tsguard claims`, which derives the README
   numbers from it and checks them.
 - A model bundle with a sha256 sidecar and a feature-code fingerprint, a FastAPI service that scores
-  one row with the batch score (`tsguard bundle`, `tsguard serve`), a container, and a latency
-  measurement against a p95 budget of 50 ms.
+  one row within a relative 1e-6 of the batch score (`tsguard bundle`, `tsguard serve`), a
+  container, and a latency measurement script against a p95 budget of 50 ms.
 - Ten injected leakage defects, each asserted to be caught by its named guard, and a determinism
   test that runs the experiment twice.
 - CI workflows for lint, tests on Python 3.11 and 3.12, leakage, protocol, determinism, smoke,
-  container, claims, a clean-clone build and commit hygiene, and a manual full-run workflow. None has run yet: the
-  GitHub repository does not exist.
+  container, claims, a clean-clone build and commit hygiene, and a manual full-run workflow. None
+  has run yet: the GitHub repository does not exist.
 - Documentation: architecture, evaluation protocol, testing, operations, four decision records.

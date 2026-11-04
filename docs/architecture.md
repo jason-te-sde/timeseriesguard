@@ -29,8 +29,9 @@ and `Dockerfile` with `docker-compose.yml` package the service (see [operations.
   rows `t - lookback + 1 .. t` and nothing else: no running sums, no recursion from the series
   start. The EWMA is a 64-row windowed EWMA for this reason, and skewness and kurtosis are
   population moments of the window. A block computation therefore gives the same bits whatever the
-  block size, and the service, which receives only the last rows, gives the same value as the batch
-  run. [ADR 0004](adr/0004-windowed-features.md) records why.
+  block size, and the service, which receives only the last rows, computes the same feature values
+  as the batch run; its scores match the batch scores within a relative 1e-6.
+  [ADR 0004](adr/0004-windowed-features.md) records why.
 - **Flat windows give zero, never NaN.** A window of identical values has exactly zero spread, so its
   spread, skew, kurtosis and FFT features are 0. Skewness and kurtosis are also 0 when the
   denominator (`m2^1.5`, `m2^2`) underflows to zero for a window of tiny but unequal values.
@@ -56,11 +57,12 @@ without reading a test label. In order:
 2. **Split.** `split_fn(n_train, n_test)` (by default `chronological_split`) gives the train and test
    indices, and `check_split_monotonic` refuses them unless every train index precedes every test
    index. Guard `split_monotonic`.
-3. **Plan.** A probe detector, built with the fold-0 seed, reports its input kind (`features` or
-   `raw`) and lookback. The specs are the registry for feature models and the single identity spec
-   for the autoencoders. `walk_forward_folds(n_train, k=3, initial_frac=0.5, purge=64)` cuts the
-   train rows into three expanding folds: fold `j` fits on `[0, b_{j-1})` and validates on
-   `[b_{j-1} + 64, b_j)`, with `b_0 = floor(n/2)` and the remaining half split in three.
+3. **Plan.** A probe detector, built with the seed `(seed, entity, model, 0)`, which no fold uses
+   (folds are numbered from 1), reports its input kind (`features` or `raw`) and lookback. The
+   specs are the registry for feature models and the single identity spec for the autoencoders.
+   `walk_forward_folds(n_train, k=3, initial_frac=0.5, purge=64)` cuts the train rows into three
+   expanding folds: fold `j` fits on `[0, b_{j-1})` and validates on `[b_{j-1} + 64, b_j)`, with
+   `b_0 = floor(n/2)` and the remaining half split in three.
    `check_fold_boundaries` refuses the folds unless every gap is at least the purge, the purge is at
    least the lookback, and the folds move forward in time. Guard `fold_boundary`.
 4. **Per fold, fit and score synthetic anomalies.**
@@ -91,9 +93,25 @@ without reading a test label. In order:
    scores, and the digests of the pipeline, the detector and the scores. With `keep_models=True` it
    also holds the fitted pipeline and detector, which is what a service bundle is made from.
 
-`EntityRunner.evaluate(selection)` is the only read of test labels in the normal flow. It enters
+`evaluate_selection(selection, labels, audit, params)` scores a selection: it enters
 `Phase.FINAL_EVALUATION`, reads the labels once as `evaluate[<model>]`, and computes the four
-protocols at the frozen threshold plus the event-level sensitivity grid.
+protocols at the frozen threshold plus the event-level sensitivity grid. `EntityRunner.evaluate` is a
+thin wrapper around it. The package reads test labels in two places, both inside
+`Phase.FINAL_EVALUATION`: `evaluate_selection`, and a segment count in `reproduce._evaluate`. In the
+experiment they are reached only after a check that no label was read during selection:
+
+- `reproduce._evaluate` calls `evaluate_selection` for every (entity, model), and reads each entity's
+  labels once more as `count_segments` to count the anomaly segments for `metrics.json`. Both happen
+  after `label_reads_at_selection` has found zero reads and no threshold frozen after a read.
+- `ablation._score` calls `evaluate_selection` for every seed, model and arm of an entity, after
+  `_check_selected_before_reading` has found the same.
+
+`EntityRunner.evaluate` makes the same read for a caller that drives a runner directly; that caller
+is responsible for the check.
+
+Outside the package, the tests that use real labels (`tests/protocol`, `tests/data`) read them inside
+a final-evaluation block, and `scripts/latency.py` loads a machine with a fresh audit and never
+reads them.
 
 A leakage error raised inside `select` or `objective` gets a note naming the entity and the model,
 so a failure deep in a 28-entity run says where it happened.

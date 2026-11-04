@@ -2,8 +2,8 @@
 
 This document fixes how a score becomes a number, and why. Every choice in it was made before any
 model was run on SMD, and none of it is tuned to a result. Results are not here: they are in the
-README block that `tsguard claims --write` generates and in `reports/metrics.json`, the one file
-every published number is derived from.
+README block that `tsguard claims --write` generates and in `reports/`: `metrics.json` is the
+source of every model number, `mlflow_runs.csv` of the run count and `latency.json` of the latency.
 
 ## The data the protocol has to handle
 
@@ -50,15 +50,15 @@ random scores) under every protocol, with five seeds (0 to 4). Measured on the r
 
 | | point adjust F1\* | point-wise F1\* | event-level AUC-PR |
 | --- | --- | --- | --- |
-| machine-1-1 | 0.963 to 0.989 | 0.173 to 0.175 | |
+| machine-1-1 | 0.963 to 0.989 | 0.173 to 0.175 | not measured |
 | 28-machine macro mean | 0.767 to 0.776 | about 0.08 | 0.039 to 0.049 |
 
 Under PA, random scores reach an F1\* that would pass for state of the art. The mechanism is the
 segment lengths: a segment of a few hundred rows almost surely contains one high random score, and
-PA then credits every row of it. The point-wise F1\* of random scores on machine-1-1 equals that of
-flagging every row, `2a / (1 + a)` for the machine's anomaly rate `a`. The same random scores get
-an event-level AUC-PR below 0.05: counting incidents and quiet hours instead of rows leaves them
-nothing to exploit.
+PA then credits every row of it. The point-wise F1\* of random scores on machine-1-1 is within 0.002
+of flagging every row, `2a / (1 + a)` for the machine's anomaly rate `a` (0.1728). The same random
+scores get an event-level AUC-PR below 0.05 on average over the 28 machines: counting incidents and
+quiet hours instead of rows leaves them nothing to exploit.
 
 The test asserts these as bounds, for every one of the five seeds: on machine-1-1, PA F1\* > 0.9 and
 point-wise F1\* at most `2a / (1 + a) + 0.02`; over the 28 machines, macro PA F1\* > 0.7, macro
@@ -154,21 +154,24 @@ How it is done here (`tsguard.eval.inject`, `tsguard.experiment.runner`):
   validation block starts 64 rows (the purge, equal to the longest feature lookback) after its fit
   window ends.
 - **Injection.** Each validation block is cut into one slot per 1,000 rows (at least two slots) and
-  one anomaly is planted per slot: a spike (1 to 3 rows), a level shift, a variance burst or a flatline,
-  chosen uniformly. Non-spike lengths are log-uniform between 3 and 240 rows, matching the 10th to
-  90th percentile of SMD's segment lengths. Each touches 1 to 8 channels, with a magnitude of 3 to 8
-  times the channel's standard deviation over the fit rows (0.1 for a channel that is constant
-  there). Neighbouring anomalies are at least 120 rows apart, one cooldown plus one chunk, so at
+  one anomaly is planted per slot, which gives 3 or 4 per block on SMD's machines. The kind is
+  chosen uniformly: a spike (1 to 3 rows) or a level shift adds a constant, and a variance burst adds
+  Gaussian noise, each with a magnitude of 3 to 8 times the channel's standard deviation over the fit
+  rows (0.1 for a channel that is constant there); a flatline holds the channel at its value in the
+  segment's first row and uses no magnitude. Non-spike lengths are log-uniform between 3 and 240
+  rows, matching the 10th to 90th percentile of SMD's segment lengths, and each anomaly touches 1 to
+  8 channels. Neighbouring anomalies are at least 120 rows apart, one cooldown plus one chunk, so at
   least one whole negative chunk survives the cooldown between them. Every draw comes from a
-  generator seeded from
-  `(seed, entity, "inject", fold)`.
+  generator seeded from `(seed, entity, "inject", fold)`.
 - **Objective.** A configuration's objective on an entity is the mean over the three folds of the
   event-level AUC-PR against the injected labels. Tuning maximizes its mean over the tuning entities.
 - **Threshold.** The threshold that maximizes event-level F1 on the last fold's injected anomalies is
-  frozen through `LabelAudit.freeze_threshold` and applied unchanged to the test scores.
+  frozen through `LabelAudit.freeze_threshold` and applied unchanged to the test scores. It rests on
+  the 3 or 4 synthetic segments of that one block, so F1 at the frozen threshold is a noisy number.
+  AUC-PR needs no threshold and does not inherit that noise.
 - **Final model.** The model that scores the test rows is the last fold's model, fitted on about the
-  first 83 % of the train rows. Refitting on the whole train half would put the frozen threshold on a
-  different model's score scale. The cost is 17 % of the training rows.
+  first 83 % (five sixths) of the train rows. Refitting on the whole train half would put the frozen
+  threshold on a different model's score scale. The cost is the last sixth of the training rows.
 - **Headline.** The headline model is the one with the highest validation objective, averaged over
   the evaluated entities. It is chosen and announced before the first test label is read, and
   `metrics.json` records `selected_by: "validation_objective"` and `label_reads_at_selection: 0`.

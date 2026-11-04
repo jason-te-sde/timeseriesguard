@@ -48,7 +48,7 @@ and how far it was verified>
 Refs #<issue>
 ```
 
-Types in use: `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `ci`, `build`, `chore`. Scopes are
+Types in use: `feat`, `fix`, `perf`, `test`, `docs`, `ci`, `build`, `chore`. Scopes are
 package names (`data`, `features`, `models`, `eval`, `experiment`, `repro`, `serve`, `cli`) or
 `deploy`, `leakage`, `determinism`.
 

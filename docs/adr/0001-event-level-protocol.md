@@ -11,8 +11,9 @@ machine ranges from 0.42 % to 15.65 %.
 
 Most published SMD numbers use point adjust (PA), which credits a whole segment when any of its rows
 crosses the threshold. With segments that long, a detector that knows nothing does very well under
-it. This was measured before the decision was taken: uniform random scores reach a PA F1\* of 0.963
-to 0.989 on machine-1-1 and 0.767 to 0.776 averaged over the 28 machines (five seeds).
+it. One seed was measured before the decision was taken: uniform random scores reached a PA F1\* of
+0.963 on machine-1-1 and about 0.78 averaged over the 28 machines. The test that now pins the result
+measured five seeds later: 0.963 to 0.989 and 0.767 to 0.776.
 
 The protocol had to be fixed before any model existed, so that it could not drift towards whatever a
 model happened to be good at.
@@ -63,7 +64,7 @@ detector.
 
 **Point-wise metrics only.** Point-wise cannot be gamed this way, but it counts rows: the longest
 segments dominate it, and it charges a detector for every minute of an incident it did not flag even
-after it raised the alarm. On machine-1-1 the best point-wise F1 of random scores is exactly that of
+after it raised the alarm. On machine-1-1 the best point-wise F1 of random scores is within 0.002 of
 flagging every row, which is the floor any detector is compared against, not a useful scale.
 
 **PA%K as the headline.** It repairs the worst of PA, but it still counts rows, the choice of `K` is

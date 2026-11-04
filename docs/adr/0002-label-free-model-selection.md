@@ -49,6 +49,9 @@ Costs:
   drift, say) is not rewarded during selection.
 - **The final model sees about 83 % of the train rows**, the last fold's fit window. Refitting on all
   of them would put the frozen threshold on another model's score scale.
+- **The frozen threshold rests on 3 or 4 synthetic segments**, those injected into the last fold's
+  validation block (one per 1,000 rows, at least two). F1 at the frozen threshold is therefore a
+  noisy number from machine to machine.
 - **Selection is expensive.** Every configuration is fitted and scored three times, and the injected
   blocks and feature matrices are cached per machine (2 to 3 GB on a real machine).
 - **F1 at the frozen threshold is lower than F1\*,** sometimes by a lot. That gap is the honest part
@@ -63,9 +66,10 @@ used for nothing.
 **Carving a labelled validation slice out of the test half.** It would select on real anomalies, but
 SMD has too few per machine: machine-2-8 has a single anomaly segment, so either the validation slice
 or the remaining test slice of that machine would have none. A slice also shortens the test period
-every number is reported on, and a threshold fitted to a handful of real segments is noisier than
-one fitted to dozens of injected ones.
+every number is reported on, and every real segment it used for selection is one fewer the
+evaluation can count. Injection does not run out: the synthetic segments come from the train half,
+which no number is reported on.
 
-**Refitting the chosen configuration on the whole train half.** It uses 17 % more data, but the
-threshold was frozen on the scores of the fold model, and a refitted model scores on a different
-scale.
+**Refitting the chosen configuration on the whole train half.** It would fit on 20 % more rows (the
+last fold leaves out the final sixth of the train half), but the threshold was frozen on the scores
+of the fold model, and a refitted model scores on a different scale.
