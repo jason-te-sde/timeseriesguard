@@ -22,6 +22,12 @@ until the full run's `reports/metrics.json` exists there is no headline to serve
 `make bundle BUNDLE_ARGS="--metrics reports/metrics.json"` bundles the headline model with its tuned
 parameters. Building reads no label: the bundle is the experiment's own selection, run once.
 
+`tsguard bundle` selects with `RunConfig()`, the default settings, and that is exactly the run
+configuration of the full profile (seed, three folds, the causality checks on, eight epochs for the
+autoencoders; the test `test_the_bundle_is_selected_with_the_config_of_the_full_profile` pins
+`FULL.run == RunConfig()`). A bundle built from `reports/metrics.json` therefore repeats, for one
+machine, the selection the full run made with the same tuned parameters.
+
 The container runs `tsguard serve --bundle /models/bundle.joblib --host 0.0.0.0 --port 8000` as an
 unprivileged user (uid 10001) on a read-only root filesystem. `docker-compose.yml` mounts
 `artifacts/bundle/` read-only at `/models` and publishes the port on `127.0.0.1` only, because the

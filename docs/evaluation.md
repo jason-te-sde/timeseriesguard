@@ -55,8 +55,9 @@ random scores) under every protocol, with five seeds (0 to 4). Measured on the r
 
 Under PA, random scores reach an F1\* that would pass for state of the art. The mechanism is the
 segment lengths: a segment of a few hundred rows almost surely contains one high random score, and
-PA then credits every row of it. The point-wise F1\* of random scores on machine-1-1 is within 0.002
-of flagging every row, `2a / (1 + a)` for the machine's anomaly rate `a` (0.1728). The same random
+PA then credits every row of it. Flagging every row of machine-1-1 scores a point-wise F1\* of
+`2a / (1 + a)` for the machine's anomaly rate `a`, which is 0.1728 for `a` = 0.0946, and the best
+point-wise F1\* of random scores is 0.175, within 0.0022 of it. The same random
 scores get an event-level AUC-PR below 0.05 on average over the 28 machines: counting incidents and
 quiet hours instead of rows leaves them nothing to exploit.
 

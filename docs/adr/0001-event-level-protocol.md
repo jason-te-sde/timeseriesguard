@@ -64,7 +64,7 @@ detector.
 
 **Point-wise metrics only.** Point-wise cannot be gamed this way, but it counts rows: the longest
 segments dominate it, and it charges a detector for every minute of an incident it did not flag even
-after it raised the alarm. On machine-1-1 the best point-wise F1 of random scores is within 0.002 of
+after it raised the alarm. On machine-1-1 the best point-wise F1 of random scores is within 0.0022 of
 flagging every row, which is the floor any detector is compared against, not a useful scale.
 
 **PA%K as the headline.** It repairs the worst of PA, but it still counts rows, the choice of `K` is

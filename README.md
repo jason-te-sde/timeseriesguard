@@ -20,7 +20,7 @@ nothing does very well. Uniform random scores, five seeds, measured on the real 
 
 | | point adjust F1\* | point-wise F1\* | event-level AUC-PR |
 | --- | --- | --- | --- |
-| machine-1-1 | 0.963 to 0.989 | 0.173 to 0.175 (within 0.002 of flagging every row) | not measured |
+| machine-1-1 | 0.963 to 0.989 | 0.173 to 0.175 (within 0.0022 of flagging every row, 0.1728) | not measured |
 | mean of 28 machines | 0.767 to 0.776 | about 0.08 | 0.039 to 0.049 |
 
 The headline here is the **event-level AUC-PR**: each anomaly segment is one positive sample, and
@@ -100,8 +100,10 @@ budget (p95 below 50 ms) are described in [docs/operations.md](docs/operations.m
   reproduce every digest bit for bit. Another BLAS or libm can change the last bit of a feature,
   and nothing claims a Linux run matches a macOS one.
 - **The full 28-machine run in CI.** It takes hours and runs locally; CI runs a two-machine smoke
-  profile. A manual workflow (`.github/workflows/full-run.yml`) can re-derive the full run on a
-  Linux runner.
+  profile. A manual workflow (`.github/workflows/full-run.yml`) is written for it, but it has never
+  run, and it may not fit a hosted runner: its reproduce step is capped at 340 minutes, and the
+  hosted runners of a private repository have 2 vCPUs, while the run is configured for four threads
+  and was made on an Apple M2. Nothing here claims that workflow can re-derive the run.
 - **CI itself, so far.** The GitHub repository has not been created yet, so the workflows are
   written and linted but have never executed, and the container image has not been built.
 - **Latency, so far.** No latency has been measured against a running service yet; the 50 ms budget

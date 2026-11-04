@@ -1,9 +1,10 @@
 name: Full run
 
-# The committed reports/metrics.json comes from the local M2 run. This workflow exists to
-# re-derive it on a clean Linux runner: start it by hand (Actions, Full run, Run workflow) and
-# compare the uploaded metrics.json with the committed one. It has no schedule on purpose: the
-# run takes hours, so it happens only when someone asks for it.
+# The committed reports/metrics.json comes from the local M2 run. This workflow is written to
+# repeat it on a clean Linux runner: start it by hand (Actions, Full run, Run workflow) and
+# compare the uploaded metrics.json with the committed one. It has never run, and the run may
+# exceed a hosted runner's limits (2 vCPUs on a private repository, 340 minutes for the step).
+# It has no schedule on purpose: the run takes hours, so it happens only when someone asks for it.
 on:
   workflow_dispatch:
 
