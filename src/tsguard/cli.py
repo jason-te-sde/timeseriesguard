@@ -4,8 +4,9 @@ Five command groups: ``data`` fetches and verifies the SMD files, ``reproduce`` 
 end to end and exports its MLflow runs, ``claims`` checks or rewrites the numbers the README
 quotes, ``bundle`` fits one model on one machine and writes it as a checksummed file, and
 ``serve`` serves such a file over HTTP. Every failure the package raises on purpose is printed as
-one line on stderr with exit code 1; a usage error exits with 2 (argparse), and anything else is
-a bug and keeps its traceback.
+one line on stderr with exit code 1, and so is a missing ``experiment`` extra (an `ImportError`
+from ``reproduce`` that names the extra to install); a usage error exits with 2 (argparse), and
+anything else is a bug and keeps its traceback.
 
 Nothing imported here may need MLflow or Optuna when it is imported: the container installs the
 runtime dependencies only and starts ``tsguard serve``.
@@ -209,15 +210,20 @@ def _reproduce(args: argparse.Namespace) -> int:
     def loader(name: str, audit: LabelAudit) -> EntityData:
         return load_entity(name, audit=audit)
 
-    reproduce(
-        profile,
-        loader=loader,
-        tracker=MlflowTracker(uri),
-        out_dir=out,
-        progress=_stderr_progress(started),
-    )
     csv_path = out / "mlflow_runs.csv"
-    rows = export_runs(uri, csv_path, experiments=[TUNING_EXPERIMENT, FINAL_EXPERIMENT])
+    try:
+        reproduce(
+            profile,
+            loader=loader,
+            tracker=MlflowTracker(uri),
+            out_dir=out,
+            progress=_stderr_progress(started),
+        )
+        rows = export_runs(uri, csv_path, experiments=[TUNING_EXPERIMENT, FINAL_EXPERIMENT])
+    except ImportError as error:
+        # Optuna and MLflow are imported on first use, so a missing `experiment` extra shows up
+        # here, as an ImportError whose message names the extra to install.
+        raise CliError(" ".join(str(error).split())) from error
     expected = len(MODEL_NAMES) * (profile.n_trials + len(profile.entities))
     if rows != expected:
         raise CliError(

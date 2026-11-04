@@ -232,6 +232,27 @@ def test_the_expected_run_count_follows_the_evaluated_entities(monkeypatch, tmp_
     assert "expected 12" in capsys.readouterr().err
 
 
+EXTRA_MESSAGE = "reproduce needs the 'experiment' extra: uv sync --extra experiment"
+
+
+@pytest.mark.parametrize("where", ["reproduce", "tracker", "export"])
+def test_a_missing_experiment_extra_is_a_message_and_exit_1(monkeypatch, tmp_path, capsys, where):
+    # Optuna and MLflow are imported lazily, so their absence surfaces as an ImportError from the
+    # first call that needs them. It is a failure of the installation, not a bug in the code.
+    def missing(*args, **kwargs):
+        raise ImportError(EXTRA_MESSAGE)
+
+    monkeypatch.setattr(cli, "reproduce", missing if where == "reproduce" else lambda *a, **k: None)
+    monkeypatch.setattr(cli, "MlflowTracker", missing if where == "tracker" else lambda uri: None)
+    monkeypatch.setattr(
+        cli, "export_runs", missing if where == "export" else lambda *a, **k: SMOKE_RUNS
+    )
+    assert main(["reproduce", "--profile", "smoke", "--out", str(tmp_path)]) == 1
+    captured = capsys.readouterr()
+    assert captured.err == f"tsguard: error: {EXTRA_MESSAGE}\n"
+    assert captured.out == ""
+
+
 def test_reproduce_rejects_an_unknown_entity_before_any_work(monkeypatch, tmp_path, capsys):
     def never(*args, **kwargs):
         raise AssertionError("reproduce must not start")
