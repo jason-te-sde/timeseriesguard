@@ -137,12 +137,16 @@ budget (p95 below 50 ms) are described in [docs/operations.md](docs/operations.m
   run, and it may not fit a hosted runner: its reproduce step is capped at 340 minutes, and the
   hosted runners of a private repository have 2 vCPUs, while the run is configured for four threads
   and was made on an Apple M2. Nothing here claims that workflow can re-derive the run.
-- **CI itself, so far.** The GitHub repository has not been created yet, so the workflows are
-  written and linted but have never executed. The container image has been built and served only on
-  the M2 (Docker Desktop, linux/arm64), not on a CI runner.
-- **Latency on other hardware.** The p95 in the results block was measured on the M2 with client and
-  container on one machine, over loopback. The `container` CI job asserts the same budget on a hosted
-  runner, but it has not run.
+- **CI, so far.** On the first pull request
+  ([#1](https://github.com/jason-te-sde/timeseriesguard/pull/1)) every job but `clean-clone` ran and
+  passed, `container` included: it built the image on linux/amd64 and served it healthy on a hosted
+  runner. `clean-clone` runs only on a push to `main`, so its first run is that pull request's
+  merge.
+- **Latency beyond one host.** Both measurements are sequential requests from a client on the same
+  machine as the container, over loopback: the p95 in the results block, on the M2, and the
+  `container` job's p95 of 14.7 ms (p99 16.1 ms) on a hosted runner (x86_64, 2 vCPUs) in the first
+  pull request's run, where the job asserts the same 50 ms budget. A network hop and concurrent
+  clients are not measured.
 - **Alerting.** The service returns a score and a decision per row. Deduplication, routing and
   paging (Slack or otherwise) are out of scope.
 - **The realism of the injected anomalies.** Model selection runs on synthetic anomalies of four

@@ -52,9 +52,8 @@ Gaps, stated so nobody assumes otherwise:
   same machine must agree bit for bit; nothing compares two processes' runs, or a macOS run with a
   Linux run, and nothing claims they agree.
 
-None of the CI jobs has run yet: the GitHub repository does not exist, so the workflows are written
-and linted (`actionlint`) but have never executed. Until they have, every row of the table above is
-verified locally only.
+Every CI job but `clean-clone` ran and passed on the first pull request (run 41959599562).
+`clean-clone` runs only on a push to `main`, so its first run is that pull request's merge.
 
 ### Tests that need the dataset fail, they never skip
 

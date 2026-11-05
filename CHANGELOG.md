@@ -37,8 +37,9 @@ schema may change between minor versions.
 - Ten injected leakage defects, each asserted to be caught by its named guard, and a determinism
   test that runs the experiment twice.
 - CI workflows for lint, tests on Python 3.11 and 3.12, leakage, protocol, determinism, smoke,
-  container, claims, a clean-clone build and commit hygiene, and a manual full-run workflow. None
-  has run yet: the GitHub repository does not exist.
+  container, claims, a clean-clone build and commit hygiene, and a manual full-run workflow. All
+  but `clean-clone` (pushes to `main` only) and the full-run workflow passed on the first pull
+  request.
 - `reports/`: the full 28-machine run (2 h 56 min on an Apple M2), its 144 tracked runs, the p95
   latency of the served headline model, and the README block derived from them.
 - Documentation: architecture, evaluation protocol, testing, operations, four decision records.
