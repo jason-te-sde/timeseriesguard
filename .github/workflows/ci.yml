@@ -1,0 +1,364 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # `uv run` re-resolves the interpreter from .python-version and would silently replace
+      # an environment synced for another Python. Pinning UV_PYTHON keeps sync and run aligned.
+      UV_PYTHON: "3.11"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.12.19"
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --all-extras --group dev --python 3.11 --locked
+      - name: Lint
+        run: make lint
+      - name: Type check
+        run: make type
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    env:
+      UV_PYTHON: ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.12.19"
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --all-extras --group dev --python ${{ matrix.python }} --locked
+      - name: Test
+        run: make test PYTEST_ARGS="--junitxml=reports-ci/junit.xml"
+      - name: Keep the evidence of a failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-evidence-py${{ matrix.python }}
+          path: |
+            .pytest_cache
+            reports-ci/junit.xml
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+
+  leakage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      UV_PYTHON: "3.11"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.12.19"
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --all-extras --group dev --python 3.11 --locked
+      - name: Leakage suite
+        run: make leakage
+
+  hygiene:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Reject co-author trailers
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          # A push can bring many commits, and the trailer may be in any of them. The range runs
+          # from the commit the branch pointed at before the push. The first push of a branch has
+          # an all-zero `before`, and after a force push the old tip may not be in the clone:
+          # both fall back to the last commit.
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            messages="$(git log --format=%B "origin/${BASE_REF}..HEAD")"
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
+              && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            messages="$(git log --format=%B "${BEFORE}..${SHA}")"
+          else
+            messages="$(git log -1 --format=%B "$SHA")"
+          fi
+          if printf '%s\n' "$messages" | grep -iE '^co-authored-by:'; then
+            echo "::error::A commit message carries a Co-Authored-By trailer. Remove it before merging."
+            exit 1
+          fi
+
+  protocol:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      UV_PYTHON: "3.11"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.12.19"
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --all-extras --group dev --python 3.11 --locked
+      - name: Restore the SMD cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/tsguard
+          key: smd-${{ hashFiles('src/tsguard/data/smd_manifest.json') }}
+      - name: Fetch SMD (a no-op on a warm cache)
+        run: |
+          # The fetch is idempotent, so a transient failure (for example a 429 from
+          # raw.githubusercontent.com) is retried instead of turning the job red.
+          for attempt in 1 2 3; do
+            if uv run tsguard data fetch; then
+              exit 0
+            fi
+            echo "::warning::data fetch attempt ${attempt} of 3 failed"
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 15))
+            fi
+          done
+          exit 1
+      - name: Protocol and data tests
+        run: uv run pytest tests/protocol tests/data -m "data or not data" -v
+
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      UV_PYTHON: "3.11"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.12.19"
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --all-extras --group dev --python 3.11 --locked
+      - name: Restore the SMD cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/tsguard
+          key: smd-${{ hashFiles('src/tsguard/data/smd_manifest.json') }}
+      - name: Fetch SMD (a no-op on a warm cache)
+        run: |
+          # The fetch is idempotent, so a transient failure (for example a 429 from
+          # raw.githubusercontent.com) is retried instead of turning the job red.
+          for attempt in 1 2 3; do
+            if uv run tsguard data fetch; then
+              exit 0
+            fi
+            echo "::warning::data fetch attempt ${attempt} of 3 failed"
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 15))
+            fi
+          done
+          exit 1
+      - name: Reproduce the smoke profile
+        run: uv run tsguard reproduce --profile smoke --out artifacts/smoke --tracking-uri sqlite:///artifacts/mlruns.db
+      - name: Slow tests
+        run: uv run pytest -m slow -v --ignore=tests/determinism
+      - name: Keep the smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: smoke-artifacts
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 7
+
+  determinism:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      UV_PYTHON: "3.11"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.12.19"
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --all-extras --group dev --python 3.11 --locked
+      - name: Restore the SMD cache (read only)
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/tsguard
+          key: smd-${{ hashFiles('src/tsguard/data/smd_manifest.json') }}
+      - name: Fetch the determinism entity (a no-op on a warm cache)
+        run: |
+          # The fetch is idempotent, so a transient failure (for example a 429 from
+          # raw.githubusercontent.com) is retried instead of turning the job red.
+          for attempt in 1 2 3; do
+            if uv run tsguard data fetch --entities machine-1-1; then
+              exit 0
+            fi
+            echo "::warning::data fetch attempt ${attempt} of 3 failed"
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 15))
+            fi
+          done
+          exit 1
+      - name: Same seed, same bytes
+        run: uv run pytest tests/determinism -m "slow or data" -v
+
+  claims:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      UV_PYTHON: "3.11"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.12.19"
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --all-extras --group dev --python 3.11 --locked
+      - name: Check the README numbers against reports/
+        run: |
+          # Until the first metrics are committed there is nothing to compare. The moment any
+          # report file exists every check is enforced, so a claims.json or an mlflow_runs.csv
+          # without its metrics.json fails here instead of passing by omission.
+          shopt -s nullglob
+          reports=(reports/*.json reports/*.csv)
+          if [ "${#reports[@]}" -eq 0 ]; then
+            echo "no reports/metrics.json yet"
+          else
+            uv run tsguard claims --check
+          fi
+
+  clean-clone:
+    # smoke already runs the same profile on every pull request, Dependabot's included. A second,
+    # cold reproduce on each of them would double the minutes of a private repository for a
+    # failure mode (an unpinned or uncommitted dependency) that only shows on the main line.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      UV_PYTHON: "3.11"
+    steps:
+      # A cold start on purpose: no actions/cache and no uv cache, so a dependency or a data file
+      # that only this machine happens to have already cannot hide here.
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.12.19"
+          enable-cache: false
+      - name: Install dependencies
+        run: uv sync --all-extras --group dev --python 3.11 --locked
+      - name: Fetch the smoke entities
+        run: |
+          # The fetch is idempotent, so a transient failure (for example a 429 from
+          # raw.githubusercontent.com) is retried instead of turning the job red.
+          for attempt in 1 2 3; do
+            if uv run tsguard data fetch --entities machine-1-1 machine-2-1; then
+              exit 0
+            fi
+            echo "::warning::data fetch attempt ${attempt} of 3 failed"
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 15))
+            fi
+          done
+          exit 1
+      - name: Reproduce the smoke profile
+        run: uv run tsguard reproduce --profile smoke --out artifacts/clean --tracking-uri sqlite:///artifacts/clean.db
+      - name: Keep the clean-clone artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: clean-clone-artifacts
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 7
+
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      UV_PYTHON: "3.11"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.12.19"
+          enable-cache: true
+      # Neither extra is installed, as in the image: if the bundle command needed MLflow or
+      # Optuna it would fail here too. The dev group brings httpx, which the latency script uses.
+      - name: Install dependencies
+        run: uv sync --group dev --python 3.11 --locked
+      - name: Restore the SMD cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/tsguard
+          # Not the key of the jobs that fetch every machine: this cache holds one machine, and
+          # sharing a key would let it be saved first and leave those jobs a partial cache.
+          key: smd-container-${{ hashFiles('src/tsguard/data/smd_manifest.json') }}
+      - name: Fetch the served machine
+        run: |
+          # The fetch is idempotent, so a transient failure (for example a 429 from
+          # raw.githubusercontent.com) is retried instead of turning the job red.
+          for attempt in 1 2 3; do
+            if uv run tsguard data fetch --entities machine-1-1; then
+              exit 0
+            fi
+            echo "::warning::data fetch attempt ${attempt} of 3 failed"
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 15))
+            fi
+          done
+          exit 1
+      # The headline model of the committed full run, with its tuned parameters, so the latency
+      # measured here is the one the README states.
+      - name: Build the bundle
+        run: uv run tsguard bundle --entity machine-1-1 --metrics reports/metrics.json --out artifacts/bundle/bundle.joblib
+      - name: Build the image and start the service
+        run: docker compose up --build --wait --wait-timeout 300
+      - name: Measure the latency
+        run: uv run python scripts/latency.py --n 2000 --warmup 100 --budget-ms 50 --out artifacts/latency-ci.json
+      - name: Keep the service logs
+        if: failure()
+        run: |
+          mkdir -p artifacts
+          docker compose logs --no-color > artifacts/compose-logs.txt 2>&1 || true
+          docker compose ps -a > artifacts/compose-ps.txt 2>&1 || true
+          # Why the healthcheck failed: its last results and their output, one line per container.
+          for container in $(docker compose ps -a -q); do
+            docker inspect --format '{{json .State.Health}}' "$container" \
+              >> artifacts/compose-health.json 2>&1 || true
+          done
+      - name: Keep the container artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: container-artifacts
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Stop the service
+        if: always()
+        run: docker compose down

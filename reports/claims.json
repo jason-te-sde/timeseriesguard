@@ -1,0 +1,30 @@
+{
+  "channels": 38,
+  "feature_specs": 63,
+  "fft_gain": {
+    "iforest": {
+      "f1_points": 2.0,
+      "f1_points_std": 1.6,
+      "f1_relative_pct": 11.4,
+      "f1_relative_pct_std": 8.3
+    },
+    "zscore": {
+      "f1_points": 2.5,
+      "f1_points_std": 1.8,
+      "f1_relative_pct": 7.4,
+      "f1_relative_pct_std": 5.5
+    }
+  },
+  "headline_auc_pr": 0.7,
+  "headline_ci95": [
+    0.62,
+    0.78
+  ],
+  "headline_model": "zscore",
+  "mlflow_runs": 144,
+  "models": 4,
+  "p95_budget_ms": 50.0,
+  "p95_ms": 6.727,
+  "test_steps": 708420,
+  "train_steps": 708405
+}

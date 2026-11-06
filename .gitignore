@@ -1,3 +1,15 @@
 .venv/
 __pycache__/
 .superpowers/
+.coverage*
+htmlcov/
+mlruns/
+mlruns.db
+artifacts/
+reports-ci/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+*.log
+run-out/

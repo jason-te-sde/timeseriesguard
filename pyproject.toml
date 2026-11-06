@@ -1,0 +1,99 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "timeseriesguard"
+version = "0.1.0.dev0"
+description = "Anomaly detection on SMD server metrics under a fixed evaluation protocol, with leakage guards enforced by the code."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Jason Te" }]
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "pandas",
+    "scikit-learn",
+    "torch",
+    "joblib",
+    "fastapi",
+    "pydantic>=2",
+    "uvicorn",
+]
+
+[project.optional-dependencies]
+experiment = ["optuna", "mlflow"]
+
+[project.scripts]
+tsguard = "tsguard.cli:main"
+
+[dependency-groups]
+dev = [
+    # 8: tests/conftest.py uses @pytest.hookimpl(wrapper=True), which older releases lack.
+    "pytest>=8",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+    "pandas-stubs",
+    "httpx",
+    # Starlette's test client (and so FastAPI's) prefers httpx2 and warns when it falls back to
+    # httpx. httpx stays for scripts/latency.py, which talks to a running service.
+    "httpx2>=2.0.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tsguard"]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "D", "T20", "N", "PT"]
+
+[tool.ruff.lint.pep8-naming]
+ignore-names = ["X", "X_*"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D"]
+"src/tsguard/cli.py" = ["T20"]
+"scripts/**" = ["T20"]
+
+[tool.mypy]
+strict = true
+files = ["src", "tests", "scripts"]
+
+[[tool.mypy.overrides]]
+module = ["sklearn.*", "joblib.*", "mlflow.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers -m 'not data and not slow'"
+markers = [
+    "data: needs the SMD dataset (fails if missing)",
+    "slow: longer than 10 s",
+]
+
+[tool.coverage.run]
+source = ["tsguard"]
+
+[tool.coverage.report]
+fail_under = 80
