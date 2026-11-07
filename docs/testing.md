@@ -52,8 +52,9 @@ Gaps, stated so nobody assumes otherwise:
   same machine must agree bit for bit; nothing compares two processes' runs, or a macOS run with a
   Linux run, and nothing claims they agree.
 
-Every CI job but `clean-clone` ran and passed on the first pull request (run 41959599562).
-`clean-clone` runs only on a push to `main`, so its first run is that pull request's merge.
+Every CI job has passed on GitHub's hosted runners (ubuntu, x86_64): all but `clean-clone` on the
+first pull request (run 41959599562), and `clean-clone`, which runs only on a push to `main`, on its
+merge (run 42150458225). No job runs on macOS or on arm64.
 
 ### Tests that need the dataset fail, they never skip
 

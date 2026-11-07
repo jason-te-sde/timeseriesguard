@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "timeseriesguard"
-version = "0.1.0.dev0"
+version = "0.1.0"
 description = "Anomaly detection on SMD server metrics under a fixed evaluation protocol, with leakage guards enforced by the code."
 readme = "README.md"
 license = "MIT"

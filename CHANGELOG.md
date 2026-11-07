@@ -5,7 +5,7 @@ All notable changes to this project are documented here. The format follows
 [semantic versioning](https://semver.org/); before 1.0, the bundle format and the `metrics.json`
 schema may change between minor versions.
 
-## 0.1.0 — Unreleased
+## 0.1.0 — 2026-11-06
 
 ### Added
 
@@ -38,8 +38,7 @@ schema may change between minor versions.
   test that runs the experiment twice.
 - CI workflows for lint, tests on Python 3.11 and 3.12, leakage, protocol, determinism, smoke,
   container, claims, a clean-clone build and commit hygiene, and a manual full-run workflow. All
-  but `clean-clone` (pushes to `main` only) and the full-run workflow passed on the first pull
-  request.
+  but the full-run workflow have passed on GitHub's hosted runners.
 - `reports/`: the full 28-machine run (2 h 56 min on an Apple M2), its 144 tracked runs, the p95
   latency of the served headline model, and the README block derived from them.
 - Documentation: architecture, evaluation protocol, testing, operations, four decision records.

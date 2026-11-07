@@ -12,11 +12,11 @@ that reproduces the problem.
 
 ## Supported versions
 
-Nothing has been released yet. Until 1.0 only the newest minor version receives fixes.
+Until 1.0 only the newest minor version receives fixes.
 
 | Version | Supported |
 | --- | --- |
-| 0.1.x | yes, once released |
+| 0.1.x | yes |
 
 ## What the project defends against, and what it does not
 
