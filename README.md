@@ -137,11 +137,10 @@ budget (p95 below 50 ms) are described in [docs/operations.md](docs/operations.m
   run, and it may not fit a hosted runner: its reproduce step is capped at 340 minutes, and the
   hosted runners of a private repository have 2 vCPUs, while the run is configured for four threads
   and was made on an Apple M2. Nothing here claims that workflow can re-derive the run.
-- **CI, so far.** On the first pull request
-  ([#1](https://github.com/jason-te-sde/timeseriesguard/pull/1)) every job but `clean-clone` ran and
-  passed, `container` included: it built the image on linux/amd64 and served it healthy on a hosted
-  runner. `clean-clone` runs only on a push to `main`, so its first run is that pull request's
-  merge.
+- **CI on other platforms.** Every CI job runs on GitHub's hosted ubuntu runners (x86_64) and has
+  passed there, `container` included: it built the image on linux/amd64 and served it healthy. No
+  job runs on macOS, where the full run was made, or on arm64; the image was built for linux/arm64
+  only on the M2.
 - **Latency beyond one host.** Both measurements are sequential requests from a client on the same
   machine as the container, over loopback: the p95 in the results block, on the M2, and the
   `container` job's p95 of 14.7 ms (p99 16.1 ms) on a hosted runner (x86_64, 2 vCPUs) in the first
