@@ -10,7 +10,7 @@
 # ecosystem proposes new python digests; the uv image moves by hand, together with the uv version
 # in .github/workflows/ci.yml.
 
-FROM python:3.11-slim@sha256:db20d8506e2f15b6db39b40b6015ca46bae855dec6dd326d462cfe79ae972893 AS builder
+FROM python:3.15-slim@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928 AS builder
 
 # The uv version CI uses (setup-uv in .github/workflows/ci.yml).
 COPY --from=ghcr.io/astral-sh/uv:0.12.19@sha256:04d046b13e60d6bcec73cbc5e1cad25d680dea90c8573340950a0ac2d1aef424 /uv /bin/uv
@@ -42,7 +42,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     && chmod -R a+rX src
 
 
-FROM python:3.11-slim@sha256:db20d8506e2f15b6db39b40b6015ca46bae855dec6dd326d462cfe79ae972893 AS runtime
+FROM python:3.15-slim@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928 AS runtime
 
 # An unprivileged user, with a fixed uid so a bind-mounted directory can be made readable for it.
 RUN groupadd --gid 10001 tsguard \
