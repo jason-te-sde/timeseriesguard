@@ -7,8 +7,9 @@
 #
 # The base images are pinned by digest: the multi-platform index each tag resolved to on the first
 # build (2026-11-04), so amd64 and arm64 hosts build from the same images. Dependabot's docker
-# ecosystem proposes new python digests; the uv image moves by hand, together with the uv version
-# in .github/workflows/ci.yml.
+# ecosystem proposes new python digests of the same tag, never a new python version: that moves by
+# hand, together with .python-version. So does the uv image, together with the uv version in
+# .github/workflows/ci.yml.
 
 FROM python:3.11-slim@sha256:db20d8506e2f15b6db39b40b6015ca46bae855dec6dd326d462cfe79ae972893 AS builder
 
