@@ -35,11 +35,17 @@ updates:
       prefix: "ci"
       include: "scope"
 
-  # The python base image of the Dockerfile, pinned by digest.
+  # The python base image of the Dockerfile, pinned by digest. Only new digests of the same tag are
+  # proposed: the build installs into the image's own interpreter and never downloads one
+  # (UV_PYTHON_DOWNLOADS=never), so the image's python must be the one .python-version names. A new
+  # python minor or major moves by hand, together with .python-version.
   - package-ecosystem: "docker"
     directory: "/"
     schedule:
       interval: "weekly"
+    ignore:
+      - dependency-name: "python"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
     groups:
       all:
         patterns:

@@ -5,6 +5,12 @@ All notable changes to this project are documented here. The format follows
 [semantic versioning](https://semver.org/); before 1.0, the bundle format and the `metrics.json`
 schema may change between minor versions.
 
+## Unreleased
+
+### Changed
+
+- Runtime dependencies: pandas 3.1.1, fastapi 0.162.2 and pydantic 2.14.3.
+
 ## 0.1.0 — 2026-11-09
 
 ### Added
