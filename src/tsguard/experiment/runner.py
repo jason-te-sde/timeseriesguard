@@ -245,7 +245,7 @@ class EntityRunner:
         self,
         data: EntityData,
         audit: LabelAudit,
-        config: RunConfig = RunConfig(),  # noqa: B008
+        config: RunConfig = RunConfig(),
         *,
         specs: Sequence[FeatureSpec] = FEATURE_SPECS,
         pipeline_factory: PipelineFactory = FeaturePipeline,
