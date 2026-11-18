@@ -96,7 +96,7 @@ def inject(
     end: int,
     sigma: np.ndarray,
     rng: np.random.Generator,
-    config: InjectionConfig = InjectionConfig(),  # noqa: B008
+    config: InjectionConfig = InjectionConfig(),
 ) -> tuple[np.ndarray, np.ndarray, tuple[InjectedSegment, ...]]:
     """Plant synthetic anomalies in the rows ``[start, end)`` of ``X``.
 
