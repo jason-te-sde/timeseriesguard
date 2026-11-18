@@ -9,7 +9,8 @@ schema may change between minor versions.
 
 ### Changed
 
-- Runtime dependencies: pandas 3.1.1, fastapi 0.162.2 and pydantic 2.14.3.
+- Runtime dependencies: pandas 3.1.1, fastapi 0.162.7 and pydantic 2.14.3.
+- Base image: a newer `python:3.11-slim` build, digest `07d4824`.
 
 ## 0.1.0 — 2026-11-09
 
