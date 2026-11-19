@@ -134,9 +134,9 @@ budget (p95 below 50 ms) are described in [docs/operations.md](docs/operations.m
   and nothing claims a Linux run matches a macOS one.
 - **The full 28-machine run in CI.** It takes hours and runs locally; CI runs a two-machine smoke
   profile. A manual workflow (`.github/workflows/full-run.yml`) is written for it, but it has never
-  run, and it may not fit a hosted runner: its reproduce step is capped at 340 minutes, and the
-  hosted runners of a private repository have 2 vCPUs, while the run is configured for four threads
-  and was made on an Apple M2. Nothing here claims that workflow can re-derive the run.
+  run, and it may not fit a hosted runner: its reproduce step is capped at 340 minutes, and a
+  hosted runner has 4 x86_64 vCPUs, while the run is configured for four threads and was made on
+  an Apple M2. Nothing here claims that workflow can re-derive the run.
 - **CI on other platforms.** Every CI job runs on GitHub's hosted ubuntu runners (x86_64) and has
   passed there, `container` included: it built the image on linux/amd64 and served it healthy. No
   job runs on macOS, where the full run was made, or on arm64; the image was built for linux/arm64

@@ -254,8 +254,8 @@ jobs:
 
   clean-clone:
     # smoke already runs the same profile on every pull request, Dependabot's included. A second,
-    # cold reproduce on each of them would double the minutes of a private repository for a
-    # failure mode (an unpinned or uncommitted dependency) that only shows on the main line.
+    # cold reproduce on each of them would double every pull request's CI time for a failure
+    # mode (an unpinned or uncommitted dependency) that only shows on the main line.
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 60
