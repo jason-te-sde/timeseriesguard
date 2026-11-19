@@ -2,8 +2,9 @@ name: Full run
 
 # The committed reports/metrics.json comes from the local M2 run. This workflow is written to
 # repeat it on a clean Linux runner: start it by hand (Actions, Full run, Run workflow) and
-# compare the uploaded metrics.json with the committed one. It has never run, and the run may
-# exceed a hosted runner's limits (4 vCPUs for a public repository, 340 minutes for the step).
+# compare the uploaded metrics.json with the committed one. It ran to completion once, on
+# 2026-11-19 (run 44461761747; 2 h 16 min for the reproduce step on 4 vCPUs, inside the 340-minute
+# cap): the README's "What the suite does not cover" compares its numbers with the committed ones.
 # It has no schedule on purpose: the run takes hours, so it happens only when someone asks for it.
 on:
   workflow_dispatch:
