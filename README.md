@@ -132,11 +132,17 @@ budget (p95 below 50 ms) are described in [docs/operations.md](docs/operations.m
 - **Bit-identity across platforms.** Two runs with one seed, in one process on one machine,
   reproduce every digest bit for bit. Another BLAS or libm can change the last bit of a feature,
   and nothing claims a Linux run matches a macOS one.
-- **The full 28-machine run in CI.** It takes hours and runs locally; CI runs a two-machine smoke
-  profile. A manual workflow (`.github/workflows/full-run.yml`) is written for it, but it has never
-  run, and it may not fit a hosted runner: its reproduce step is capped at 340 minutes, and a
-  hosted runner has 4 x86_64 vCPUs, while the run is configured for four threads and was made on
-  an Apple M2. Nothing here claims that workflow can re-derive the run.
+- **The full 28-machine run in CI.** It takes hours, so CI runs a two-machine smoke profile on
+  every change. The manual workflow (`.github/workflows/full-run.yml`) repeated the full run once,
+  on 2026-11-19, on a hosted runner (x86_64, 4 vCPUs) at commit 1e91a3f; its reproduce step took
+  2 h 16 min. It chose the same headline model with the same validation objective, its headline
+  event-level AUC-PR is 0.698868 against the committed 0.698874, every macro-mean AUC-PR of the
+  four models under the four protocols is within 0.0009 of the committed value, and the FFT
+  ablation's relative F1 change is +7.4% ± 5.5 for the z-score (the same) and +11.6% ± 8.4 for
+  Isolation Forest (+11.4% ± 8.3 committed). Its `metrics.json` and `mlflow_runs.csv` are in
+  [`reports/linux-run/`](reports/linux-run/). That is one run on one runner, not a promise for
+  every platform, and no score digest matched bit for bit (see the previous point). An earlier
+  attempt was cancelled after 2 h 12 min with no reason in its log.
 - **CI on other platforms.** Every CI job runs on GitHub's hosted ubuntu runners (x86_64) and has
   passed there, `container` included: it built the image on linux/amd64 and served it healthy. No
   job runs on macOS, where the full run was made, or on arm64; the image was built for linux/arm64

@@ -7,6 +7,12 @@ schema may change between minor versions.
 
 ## Unreleased
 
+### Added
+
+- `reports/linux-run/`: the full run repeated on a hosted Linux runner (x86_64, 4 vCPUs), and a
+  comparison with the committed M2 run in the README: the same headline model and validation
+  objective, and every macro-mean AUC-PR within 0.0009.
+
 ### Changed
 
 - Runtime dependencies: newer patch and minor releases of pandas, fastapi and pydantic. Dependabot
