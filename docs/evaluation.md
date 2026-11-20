@@ -105,11 +105,33 @@ first model ran.
 
 ### Sensitivity grid
 
-To show the headline does not hinge on the two constants, every evaluation also computes the
+To show how much the headline depends on the two constants, every evaluation also computes the
 event-level AUC-PR for `(L, C)` in `{30, 60, 120} x {0, 60}`, for every model and entity
 (`EntityRunner` and `SENSITIVITY_GRID` in `tsguard.experiment.runner`). `metrics.json` holds them
 per entity under `sensitivity` and as macro means under `sensitivity_macro`, keyed `L<chunk>_C<cooldown>`.
 The headline uses `L60_C60` only.
+
+What the grid shows (macro-mean event-level AUC-PR, from `sensitivity_macro` in `reports/metrics.json`):
+
+| `(L, C)` | zscore (headline) | lstm_ae | cnn_ae | iforest |
+| --- | ---: | ---: | ---: | ---: |
+| `L30_C0` | 0.5589 | 0.7192 | 0.6571 | 0.4547 |
+| `L30_C60` | 0.6803 | 0.7296 | 0.6708 | 0.5237 |
+| `L60_C0` | 0.5935 | 0.7247 | 0.6683 | 0.4802 |
+| `L60_C60` | 0.6989 | 0.7347 | 0.6812 | 0.5427 |
+| `L120_C0` | 0.6120 | 0.7328 | 0.6820 | 0.4994 |
+| `L120_C60` | 0.7156 | 0.7413 | 0.6920 | 0.5666 |
+
+- **The z-score headline does depend on the cooldown.** Its value runs from 0.5589 to 0.7156 over the
+  six cells, and moving from `L60_C60` to `L60_C0` takes it from 0.6989 to 0.5935. With the cooldown
+  on, it ranks second behind `lstm_ae` in all three chunk lengths; at `C = 0` it ranks third, behind
+  both autoencoders, in all three. Dropping the cooldown costs it 0.10 to 0.12 at each `L`, against
+  about 0.01 for `lstm_ae` and `cnn_ae` and 0.06 to 0.07 for `iforest`.
+- **The chunk length matters less.** At `C = 60` the z-score moves from 0.6803 (`L = 30`) to 0.7156
+  (`L = 120`).
+- **The autoencoders barely move** (`lstm_ae` 0.7192 to 0.7413 over the grid), and `lstm_ae` is first
+  in every cell. The headline is the z-score because the validation objective chose it, not because
+  it leads the grid.
 
 ## PA%K
 
