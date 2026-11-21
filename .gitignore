@@ -1,6 +1,5 @@
 .venv/
 __pycache__/
-.superpowers/
 .coverage*
 htmlcov/
 mlruns/

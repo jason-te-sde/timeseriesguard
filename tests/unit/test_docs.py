@@ -7,8 +7,8 @@ copy fails the build instead of misleading a reader.
 
 from __future__ import annotations
 
-import os
 import re
+import subprocess
 from pathlib import Path
 
 from tests.leakage.defects import DEFECTS
@@ -28,20 +28,6 @@ ADR_SECTIONS = ("## Context", "## Decision", "## Consequences", "## Rejected alt
 
 DEFECT_TABLE_HEADER = ("id", "defect", "guard")
 SCANNED_SUFFIXES = frozenset({".md", ".py", ".toml", ".yml", ".yaml"})
-SKIPPED_DIRS = frozenset(
-    {
-        ".git",
-        ".venv",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
-        ".superpowers",
-        "__pycache__",
-        "artifacts",
-        "htmlcov",
-        "mlruns",
-    }
-)
 SKIPPED_FILES = frozenset({"uv.lock"})
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})")
 # Domains reserved for documentation and testing (RFC 2606, RFC 6761) reach no mailbox, so a
@@ -89,16 +75,19 @@ def defect_table(text: str) -> dict[str, str]:
 
 
 def repository_text_files(root: Path) -> list[Path]:
-    """Return every file under ``root`` whose suffix is scanned, outside caches and the venv."""
+    """Return every tracked file under ``root`` whose suffix is scanned.
+
+    Reading the index rather than walking the disk keeps caches, virtual environments and local
+    workspaces out of the scan without naming any of them.
+    """
+    listed = subprocess.run(
+        ["git", "ls-files", "-z"], cwd=root, capture_output=True, check=True
+    ).stdout.decode("utf-8")
     found: list[Path] = []
-    for directory, subdirs, files in os.walk(root):
-        subdirs[:] = sorted(
-            d for d in subdirs if d not in SKIPPED_DIRS and not d.endswith(".egg-info")
-        )
-        for name in sorted(files):
-            path = Path(directory) / name
-            if name not in SKIPPED_FILES and path.suffix in SCANNED_SUFFIXES:
-                found.append(path)
+    for name in sorted(filter(None, listed.split("\0"))):
+        path = root / name
+        if path.name not in SKIPPED_FILES and path.suffix in SCANNED_SUFFIXES and path.is_file():
+            found.append(path)
     return found
 
 
